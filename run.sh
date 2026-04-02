@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh – Run the NBA Scraper Agent (run in WSL)
+# run.sh – Run the Scraper Agent (run in WSL)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -12,9 +12,12 @@ if [ ! -d "venv" ]; then
 fi
 source venv/bin/activate
 
-# Usage: ./run.sh [once|loop] [--dry-run]
+# Usage: ./run.sh [once|loop] [--dry-run] [--provider <key>]
+#   Examples:
+#     ./run.sh once --dry-run
+#     ./run.sh loop --provider espn-nba
 MODE="${1:-loop}"
 shift 2>/dev/null || true
 
-echo "=== NBA Scraper Agent – mode: $MODE $* ==="
+echo "=== Scraper Agent – mode: $MODE $* ==="
 python3 scraper.py "$MODE" "$@"
