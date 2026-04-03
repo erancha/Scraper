@@ -63,8 +63,9 @@ class Provider(ABC):
 
     def format_text(self, items: list[dict], heading: str) -> str:
         """All items as plain text. Override for custom layout."""
-        sections = [heading, "=" * len(heading), ""]
+        sections = [heading, "-" * len(heading), ""]
         for item in items:
             sections.append(self.item_to_text(item))
-            sections.append("-" * 60)
+            sections.append("-" * 100)
+        sections.append("=" * 100)
         return "\n".join(sections)

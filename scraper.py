@@ -69,7 +69,8 @@ def provider_state(state: dict, provider: Provider) -> dict:
 def send_email(subject: str, html_body: str, plain_body: str) -> None:
     """Send an email via SMTP (TLS). Skipped when DRY_RUN is True."""
     if DRY_RUN:
-        print(f"[{datetime.now().strftime('%H:%M')}] [DRY-RUN] Email would be sent – skipping actual send.")
+        print(f"[{datetime.now().strftime('%H:%M')}] [DRY-RUN] Email would be sent – skipping actual send.\n"
+              f"Subject: {subject}\n{plain_body}")
         return
 
     if not SMTP_USER or not SMTP_PASS:
