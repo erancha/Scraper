@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-STATE_FILE = Path(__file__).parent / "state.json"
-EMAIL_TO = [addr.strip() for addr in os.getenv("EMAIL_TO", "erancha@gmail.com").split(",")]
+STATE_FILE = Path(os.getenv("STATE_FILE", str(Path(__file__).parent / "state.json")))
+EMAIL_TO = [addr.strip() for addr in os.getenv("EMAIL_TO", "").split(",") if addr.strip()]
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
@@ -81,6 +81,11 @@ def send_email(subject: str, html_body: str, plain_body: str) -> None:
     """Send an email via SMTP (TLS). Skipped when DRY_RUN is True."""
     if DRY_RUN:
         logger.info("[DRY-RUN] Email would be sent \u2013 skipping actual send.\nSubject: %s\n%s", subject, plain_body)
+        return
+
+    if not EMAIL_TO:
+        logger.warning("EMAIL_TO not configured \u2013 skipping email.")
+        logger.info("Set EMAIL_TO in .env to enable email.")
         return
 
     if not SMTP_USER or not SMTP_PASS:
