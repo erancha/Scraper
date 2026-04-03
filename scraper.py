@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 STATE_FILE = Path(__file__).parent / "state.json"
-EMAIL_TO = os.getenv("EMAIL_TO", "erancha@gmail.com")
+EMAIL_TO = [addr.strip() for addr in os.getenv("EMAIL_TO", "erancha@gmail.com").split(",")]
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
@@ -90,13 +90,13 @@ def send_email(subject: str, html_body: str, plain_body: str) -> None:
     msg.attach(MIMEText(html_body, "html"))
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
-    msg["To"] = EMAIL_TO
+    msg["To"] = ", ".join(EMAIL_TO)
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, [EMAIL_TO], msg.as_string())
-    logger.info("Email sent to %s", EMAIL_TO)
+        server.sendmail(SMTP_USER, EMAIL_TO, msg.as_string())
+    logger.info("Email sent to %s", ", ".join(EMAIL_TO))
 
 
 # ---------------------------------------------------------------------------
