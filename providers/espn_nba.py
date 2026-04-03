@@ -148,7 +148,7 @@ class EspnNba(Provider):
         dt = g.get("date", "")
         if dt:
             try:
-                dt_obj = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                dt_obj = datetime.fromisoformat(dt.replace("Z", "+00:00")).astimezone()
                 dt_display = dt_obj.strftime("%I:%M %p  %b %d, %Y %Z")
             except Exception:
                 dt_display = dt
@@ -210,7 +210,7 @@ class EspnNba(Provider):
 
             dt = g.get("date", "")
             try:
-                dt_obj = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                dt_obj = datetime.fromisoformat(dt.replace("Z", "+00:00")).astimezone()
                 time_str = dt_obj.strftime("%I:%M %p")
             except Exception:
                 time_str = dt

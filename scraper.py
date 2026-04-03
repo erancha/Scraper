@@ -69,7 +69,7 @@ def provider_state(state: dict, provider: Provider) -> dict:
 def send_email(subject: str, html_body: str, plain_body: str) -> None:
     """Send an email via SMTP (TLS). Skipped when DRY_RUN is True."""
     if DRY_RUN:
-        print("[DRY-RUN] Email would be sent – skipping actual send.")
+        print(f"[{datetime.now().strftime('%H:%M')}] [DRY-RUN] Email would be sent – skipping actual send.")
         return
 
     if not SMTP_USER or not SMTP_PASS:
@@ -111,14 +111,13 @@ def check_once(provider: Provider) -> None:
 
     # On first run, print the current state so the user sees something
     if first_run:
-        print(f"\n[{datetime.now(timezone.utc).isoformat()}] "
+        print(f"\n[{datetime.now().strftime('%H:%M')}] "
               f"[{provider.name}] Initial fetch ({len(items)} item(s)):")
         print(provider.format_text(items, provider.heading(day_label)))
 
     # ---- Completion evaluation ----
-    # Compare the set of completed IDs from this fetch against the IDs stored
-    # in state.json.  An email is sent ONLY when at least one new ID appears
-    # in the completed set that wasn't there before.
+    # Compare the set of completed IDs from this fetch against the IDs stored in state.json.  
+    # An email is sent ONLY when at least one new ID appears in the completed set that wasn't there before.
     current_completed = provider.get_completed_ids(items)
     newly_completed = current_completed - known_completed
 
@@ -129,7 +128,7 @@ def check_once(provider: Provider) -> None:
             save_state(state)
         return
 
-    print(f"\n[{datetime.now(timezone.utc).isoformat()}] "
+    print(f"\n[{datetime.now().strftime('%H:%M')}] "
           f"[{provider.name}] {len(newly_completed)} item(s) newly completed \u2013 sending email \u2026")
     if not first_run:
         print(provider.format_text(items, provider.heading(day_label)))
@@ -159,8 +158,10 @@ def run_loop(provider: Provider) -> None:
             print(f"[ERR] [{provider.name}] Network error: {exc}")
         except Exception as exc:
             print(f"[ERR] [{provider.name}] Unexpected error: {exc}")
-        print(f"\n… sleeping {CHECK_INTERVAL}s …")
-        time.sleep(CHECK_INTERVAL)
+        now = time.time()
+        sleep_secs = CHECK_INTERVAL - (now % CHECK_INTERVAL)
+        # print(f"\n… sleeping {sleep_secs}s …")
+        time.sleep(sleep_secs)
 
 
 # ---------------------------------------------------------------------------
