@@ -7,17 +7,11 @@ URL, JSON parsing, game-completion detection, and text/HTML formatting.
 
 from datetime import datetime
 
-import requests
-
 from .base import Provider
 
 
 class EspnNba(Provider):
     """Scrapes the ESPN NBA scoreboard via their public JSON API."""
-
-    SCOREBOARD_URL = (
-        "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
-    )
 
     # -- Provider identity ---------------------------------------------------
 
@@ -29,16 +23,14 @@ class EspnNba(Provider):
     def state_key(self) -> str:
         return "espn_nba"
 
+    @property
+    def url(self) -> str:
+        return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+
     def heading(self, day_label: str) -> str:
         return f"NBA Scoreboard – {day_label}"
 
-    # -- Fetch & parse -------------------------------------------------------
-
-    def fetch(self) -> dict:
-        """Fetch ESPN NBA scoreboard JSON for today."""
-        resp = requests.get(self.SCOREBOARD_URL, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+    # -- Parse ---------------------------------------------------------------
 
     def parse(self, data: dict) -> list[dict]:
         """Parse the ESPN JSON into a flat list of game dicts."""

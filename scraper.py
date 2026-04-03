@@ -7,6 +7,7 @@ All URL-specific logic lives in source plugins under providers/.
 """
 
 import json
+import logging
 import os
 import smtplib
 import sys
@@ -23,6 +24,13 @@ from providers import DEFAULT_PROVIDER_KEY, PROVIDERS
 from providers.base import Provider
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -69,13 +77,12 @@ def provider_state(state: dict, provider: Provider) -> dict:
 def send_email(subject: str, html_body: str, plain_body: str) -> None:
     """Send an email via SMTP (TLS). Skipped when DRY_RUN is True."""
     if DRY_RUN:
-        print(f"[{datetime.now().strftime('%H:%M')}] [DRY-RUN] Email would be sent – skipping actual send.\n"
-              f"Subject: {subject}\n{plain_body}")
+        logger.info("[DRY-RUN] Email would be sent \u2013 skipping actual send.\nSubject: %s\n%s", subject, plain_body)
         return
 
     if not SMTP_USER or not SMTP_PASS:
-        print("[WARN] SMTP credentials not configured – skipping email.")
-        print("[INFO] Set SMTP_USER and SMTP_PASS in .env to enable email.")
+        logger.warning("SMTP credentials not configured \u2013 skipping email.")
+        logger.info("Set SMTP_USER and SMTP_PASS in .env to enable email.")
         return
 
     msg = MIMEMultipart("alternative")  # plain text + HTML; email client picks the best it can render
@@ -89,7 +96,7 @@ def send_email(subject: str, html_body: str, plain_body: str) -> None:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(SMTP_USER, [EMAIL_TO], msg.as_string())
-    print(f"[OK] Email sent to {EMAIL_TO}")
+    logger.info("Email sent to %s", EMAIL_TO)
 
 
 # ---------------------------------------------------------------------------
@@ -110,11 +117,11 @@ def check_once(provider: Provider) -> None:
     day_label = provider.get_day_label(data)
     first_run = prov_state.get("last_check") is None
 
-    # On first run, print the current state so the user sees something
+    # On first run, log the current state so the user sees something
     if first_run:
-        print(f"\n[{datetime.now().strftime('%H:%M')}] "
-              f"[{provider.name}] Initial fetch ({len(items)} item(s)):")
-        print(provider.format_text(items, provider.heading(day_label)))
+        logger.info("[%s] Initial fetch (%d item(s)):\n%s",
+                    provider.name, len(items),
+                    provider.format_text(items, provider.heading(day_label)))
 
     # ---- Completion evaluation ----
     # Compare the set of completed IDs from this fetch against the IDs stored in state.json.  
@@ -129,10 +136,10 @@ def check_once(provider: Provider) -> None:
             save_state(state)
         return
 
-    print(f"\n[{datetime.now().strftime('%H:%M')}] "
-          f"[{provider.name}] {len(newly_completed)} item(s) newly completed \u2013 sending email \u2026")
+    logger.info("[%s] %d item(s) newly completed \u2013 sending email \u2026",
+                provider.name, len(newly_completed))
     if not first_run:
-        print(provider.format_text(items, provider.heading(day_label)))
+        logger.info("%s", provider.format_text(items, provider.heading(day_label)))
 
     subject = f"{provider.name} Update \u2013 {day_label}"
     html_body = (
@@ -151,17 +158,18 @@ def check_once(provider: Provider) -> None:
 
 def run_loop(provider: Provider) -> None:
     """Continuously poll the given provider at CHECK_INTERVAL seconds."""
-    print(f"Scraper Agent started (provider={provider.name}, interval={CHECK_INTERVAL}s, recipient={EMAIL_TO})")
+    logger.info("Scraper Agent started (provider=%s, interval=%ds, recipient=%s)",
+                provider.name, CHECK_INTERVAL, EMAIL_TO)
     while True:
         try:
             check_once(provider)
         except requests.RequestException as exc:
-            print(f"[ERR] [{provider.name}] Network error: {exc}")
+            logger.error("[%s] Network error: %s", provider.name, exc)
         except Exception as exc:
-            print(f"[ERR] [{provider.name}] Unexpected error: {exc}")
+            logger.error("[%s] Unexpected error: %s", provider.name, exc)
         now = time.time()
         sleep_secs = CHECK_INTERVAL - (now % CHECK_INTERVAL)
-        # print(f"\n… sleeping {sleep_secs}s …")
+        logger.debug("Sleeping %.0fs until next check boundary", sleep_secs)
         time.sleep(sleep_secs)
 
 
@@ -173,7 +181,7 @@ if __name__ == "__main__":
     if "--dry-run" in args:
         DRY_RUN = True
         args.remove("--dry-run")
-        print("[DRY-RUN] Email sending disabled.")
+        logger.info("[DRY-RUN] Email sending disabled.")
 
     # --provider <key>  (default: espn-nba)
     provider_key = DEFAULT_PROVIDER_KEY
@@ -183,7 +191,7 @@ if __name__ == "__main__":
         del args[idx:idx + 2]
 
     if provider_key not in PROVIDERS:
-        print(f"[ERR] Unknown provider '{provider_key}'. Available: {', '.join(PROVIDERS)}")
+        logger.error("Unknown provider '%s'. Available: %s", provider_key, ', '.join(PROVIDERS))
         sys.exit(1)
     active_provider = PROVIDERS[provider_key]
 
@@ -193,6 +201,6 @@ if __name__ == "__main__":
     elif mode == "loop":
         run_loop(active_provider)
     else:
-        print(f"Usage: {sys.argv[0]} [once|loop] [--dry-run] [--provider <key>]")
-        print(f"Available providers: {', '.join(PROVIDERS)}")
+        logger.error("Usage: %s [once|loop] [--dry-run] [--provider <key>]", sys.argv[0])
+        logger.error("Available providers: %s", ', '.join(PROVIDERS))
         sys.exit(1)

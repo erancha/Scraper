@@ -8,6 +8,8 @@ then register it in providers/__init__.py.
 
 from abc import ABC, abstractmethod
 
+import requests
+
 
 class Provider(ABC):
     """Interface that every data provider must implement."""
@@ -24,9 +26,10 @@ class Provider(ABC):
         """Unique key used to namespace this provider's data in state.json."""
         ...
 
+    @property
     @abstractmethod
-    def fetch(self) -> dict:
-        """Fetch raw data from the remote URL/API. Returns the raw payload."""
+    def url(self) -> str:
+        """The remote URL/API endpoint to fetch data from."""
         ...
 
     @abstractmethod
@@ -57,9 +60,15 @@ class Provider(ABC):
     # ------------------------------------------------------------------
     # Default implementations (can be overridden)
     # ------------------------------------------------------------------
+    def fetch(self) -> dict:
+        """Fetch raw JSON data from self.url. Override for non-JSON APIs."""
+        resp = requests.get(self.url, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
     def heading(self, day_label: str) -> str:
         """Display heading for output/emails. Override for custom labels."""
-        return f"{self.name} – {day_label}"
+        return f"{self.name} \u2013 {day_label}"
 
     def format_text(self, items: list[dict], heading: str) -> str:
         """All items as plain text. Override for custom layout."""
