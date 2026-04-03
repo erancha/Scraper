@@ -6,11 +6,14 @@ Generic scraper that polls one or more Sources (see sources/), detects newly com
 All URL-specific logic lives in source plugins under providers/.
 """
 
+import sys
+if sys.version_info < (3, 8):
+    sys.exit("Python 3.8+ is required. Current version: " + sys.version)
+
 import json
 import logging
 import os
 import smtplib
-import sys
 import time
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart

@@ -7,6 +7,13 @@ cd "$SCRIPT_DIR"
 
 echo "=== NBA Scraper Agent – Setup ==="
 
+# Check Python version (require 3.8+)
+PYTHON_VERSION=$(python3 -c 'import sys; print(sys.version_info[:2] >= (3, 8))' 2>/dev/null || echo "False")
+if [ "$PYTHON_VERSION" != "True" ]; then
+    echo "[ERR] Python 3.8+ is required. Current: $(python3 --version 2>/dev/null || echo 'not found')"
+    exit 1
+fi
+
 # Install python3-venv if missing
 if ! dpkg -s python3-venv &>/dev/null; then
     echo "[*] Installing python3-venv …"
