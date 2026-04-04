@@ -113,8 +113,8 @@ def send_email(subject: str, html_body: str, plain_body: str) -> None:
 def check_once(provider: Provider) -> None:
     """Run a single scrape-check-email cycle for the given provider."""
     state = load_state()
-    prov_state = provider_state(state, provider)
-    known_completed: set[str] = set(prov_state.get("completed_ids", []))
+    provider_state_data = provider_state(state, provider)
+    known_completed: set[str] = set(provider_state_data.get("completed_ids", []))
 
     data = provider.fetch()
     items = provider.parse(data)
@@ -123,7 +123,7 @@ def check_once(provider: Provider) -> None:
         return
 
     day_label = provider.get_day_label(data)
-    first_run = prov_state.get("last_check") is None
+    first_run = provider_state_data.get("last_check") is None
 
     # On first run, log the current state so the user sees something
     if first_run:
@@ -140,7 +140,7 @@ def check_once(provider: Provider) -> None:
     if not newly_completed:
         # On first run, save state even without completions so we don't repeat the initial print
         if first_run:
-            prov_state["last_check"] = datetime.now(timezone.utc).isoformat()
+            provider_state_data["last_check"] = datetime.now(timezone.utc).isoformat()
             save_state(state)
         return
 
@@ -159,8 +159,8 @@ def check_once(provider: Provider) -> None:
     send_email(subject, html_body, plain_body)
 
     # Update state only when new completions are found
-    prov_state["completed_ids"] = list(known_completed | current_completed)
-    prov_state["last_check"] = datetime.now(timezone.utc).isoformat()
+    provider_state_data["completed_ids"] = list(known_completed | current_completed)
+    provider_state_data["last_check"] = datetime.now(timezone.utc).isoformat()
     save_state(state)
 
 
