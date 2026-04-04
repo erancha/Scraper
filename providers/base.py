@@ -70,7 +70,7 @@ class Provider(ABC):
         """Display heading for output/emails. Override for custom labels."""
         return f"{self.name} \u2013 {day_label}"
 
-    def format_text(self, items: list[dict], heading: str) -> str:
+    def items_to_plain_table(self, items: list[dict], heading: str) -> str:
         """All items as plain text. Override for custom layout."""
         sections = [heading, "-" * len(heading), ""]
         for item in items:
