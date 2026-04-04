@@ -7,6 +7,8 @@ URL, JSON parsing, game-completion detection, and text/HTML formatting.
 
 from datetime import datetime
 
+import requests
+
 from .base import Provider
 
 
@@ -26,6 +28,25 @@ class EspnNba(Provider):
     @property
     def url(self) -> str:
         return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+
+    @property
+    def standings_url(self) -> str:
+        return "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
+
+    def fetch(self) -> dict:
+        """Fetch scoreboard JSON and cache the standings JSON for formatting."""
+        resp = requests.get(self.url, timeout=30)
+        resp.raise_for_status()
+        scoreboard = resp.json()
+
+        try:
+            standings_resp = requests.get(self.standings_url, timeout=30)
+            standings_resp.raise_for_status()
+            self._standings_data = standings_resp.json()
+        except Exception:
+            self._standings_data = None
+
+        return scoreboard
 
     def heading(self, day_label: str) -> str:
         return f"NBA Scoreboard – {day_label}"
@@ -237,13 +258,146 @@ class EspnNba(Provider):
                 f"</tr>"
             )
 
-        return (
+        games_table = (
             "<table border='1' cellpadding='6' cellspacing='0' "
             "style='border-collapse:collapse;font-family:Arial,sans-serif;'>"
             "<tr style='background:#1a1a2e;color:#fff;'>"
             "<th>Time</th><th>Away</th><th>Score</th><th>Score</th>"
             "<th>Home</th><th>Away Leaders</th><th>Home Leaders</th>"
             "<th>Venue</th><th>Box Score</th></tr>"
+            + "\n".join(rows)
+            + "</table>"
+        )
+
+        standings_section = ""
+        standings_data = getattr(self, "_standings_data", None)
+        if standings_data:
+            standings = self._parse_standings(standings_data)
+            if standings and (standings.get("conferences") or []):
+                season_label = standings.get("seasonDisplayName", "")
+                standings_section += "<br><h3>NBA Standings" + (f" {season_label}" if season_label else "") + "</h3>"
+                for conf in standings.get("conferences", []):
+                    standings_section += "<h4>" + conf.get("name", "") + "</h4>"
+                    standings_section += self._standings_to_html_table(conf)
+
+        return games_table + standings_section
+
+    def _parse_standings(self, data: dict) -> dict:
+        conferences = []
+        for child in data.get("children", []):
+            if not child.get("isConference"):
+                continue
+
+            standings_obj = (child.get("standings") or {})
+            entries = standings_obj.get("entries", [])
+            rows = []
+            for e in entries:
+                team = (e.get("team") or {})
+                stats = e.get("stats", [])
+
+                def stat_display(name: str) -> str:
+                    """Return the human-formatted (string) display value for a given stat.
+
+                    Uses ESPN's `displayValue` field (e.g. ".727", "W2", "4.5"), which is
+                    intended for presentation.
+                    """
+                    for s in stats:
+                        if s.get("name") == name or s.get("type") == name:
+                            return str(s.get("displayValue", ""))
+                    return ""
+
+                def stat_value(name: str) -> float:
+                    """Return the numeric value for a given stat (for sorting/math).
+
+                    Uses ESPN's raw `value` field, which is suitable for comparisons and
+                    ordering (e.g. winPercent as 0.72727275).
+                    """
+                    for s in stats:
+                        if s.get("name") == name or s.get("type") == name:
+                            try:
+                                return float(s.get("value", 0.0) or 0.0)
+                            except Exception:
+                                return 0.0
+                    return 0.0
+
+                def record_summary(record_type: str) -> str:
+                    """Return the record summary string for record-type stats.
+
+                    Example: lasttengames -> "8-2".
+                    """
+                    for s in stats:
+                        if s.get("type") == record_type:
+                            return str(s.get("summary", s.get("displayValue", "")))
+                    return ""
+
+                seed = stat_display("playoffSeed")
+                clincher = stat_display("clincher")
+                rows.append(
+                    {
+                        "seed": seed,
+                        "clincher": clincher,
+                        "abbr": team.get("abbreviation", ""),
+                        "team": team.get("displayName", ""),
+                        "wins": stat_display("wins"),
+                        "losses": stat_display("losses"),
+                        "pct": stat_display("winPercent"),
+                        "pct_value": stat_value("winPercent"),
+                        "gb": stat_display("gamesBehind"),
+                        "streak": stat_display("streak"),
+                        "l10": record_summary("lasttengames"),
+                    }
+                )
+
+            """Sort standings within the conference by winning percentage (PCT) descending.
+
+            - Primary key: `pct_value` (float), sorted descending by using `-pct_value` (Python sorts ascending by default.)
+            - Secondary key: `seed` as a stable tiebreaker to keep deterministic output when two teams have the same PCT.
+
+            The `key` function is called once per element in `rows`.
+            Each element is a single standings row dict (one team).
+            """
+            rows.sort(key=lambda row: (-float(row.get("pct_value", 0.0) or 0.0), str(row.get("seed", ""))))
+
+            conferences.append(
+                {
+                    "name": child.get("name", ""),
+                    "abbreviation": child.get("abbreviation", ""),
+                    "rows": rows,
+                }
+            )
+
+        season_display_name = ""
+        for child in data.get("children", []):
+            standings_obj = (child.get("standings") or {})
+            season_display_name = standings_obj.get("seasonDisplayName") or season_display_name
+
+        return {"seasonDisplayName": season_display_name, "conferences": conferences}
+
+    def _standings_to_html_table(self, conf: dict) -> str:
+        rows = []
+        for r in conf.get("rows", []):
+            seed = r.get("seed", "")
+            clincher = r.get("clincher", "")
+            seed_cell = (clincher + " " if clincher else "") + str(seed)
+            rows.append(
+                "<tr>"
+                f"<td style='text-align:center'>{seed_cell}</td>"
+                f"<td>{r.get('abbr','')} &nbsp; {r.get('team','')}</td>"
+                f"<td style='text-align:center'>{r.get('wins','')}</td>"
+                f"<td style='text-align:center'>{r.get('losses','')}</td>"
+                f"<td style='text-align:center'>{r.get('pct','')}</td>"
+                f"<td style='text-align:center'>{r.get('gb','')}</td>"
+                f"<td style='text-align:center'>{r.get('streak','')}</td>"
+                f"<td style='text-align:center'>{r.get('l10','')}</td>"
+                "</tr>"
+            )
+
+        return (
+            "<table border='1' cellpadding='6' cellspacing='0' "
+            "style='border-collapse:collapse;font-family:Arial,sans-serif;'>"
+            "<tr style='background:#1a1a2e;color:#fff;'>"
+            "<th>Seed</th><th>Team</th><th>W</th><th>L</th><th>PCT</th><th>GB</th><th>STRK</th><th>L10</th>"
+            "</tr>"
             + "\n".join(rows)
             + "</table>"
         )
