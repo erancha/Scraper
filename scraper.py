@@ -119,43 +119,39 @@ def check_once(provider: Provider) -> None:
     data = provider.fetch()
     items = provider.parse(data)
 
-    if not items:
+    current_completed = provider.get_completed_ids(items)
+    completed_items = [item for item in items if str(item.get("id")) in current_completed]
+
+    first_run = provider_state_data.get("last_check") is None
+    if first_run:
+        provider_state_data["last_check"] = datetime.now(timezone.utc).isoformat()
+        save_state(state)
+
+    if not completed_items:
         return
 
-    day_label = provider.get_day_label(data)
-    first_run = provider_state_data.get("last_check") is None
-
-    # On first run, log the current state so the user sees something
-    if first_run:
-        logger.info("[%s] Initial fetch (%d item(s)):\n%s",
-                    provider.name, len(items),
-                    provider.format_text(items, provider.heading(day_label)))
-
     # ---- Completion evaluation ----
-    # Compare the set of completed IDs from this fetch against the IDs stored in state.json.  
+    # Compare the set of completed IDs from this fetch against the IDs stored in state.json.
     # An email is sent ONLY when at least one new ID appears in the completed set that wasn't there before.
-    current_completed = provider.get_completed_ids(items)
     newly_completed = current_completed - known_completed
 
     if not newly_completed:
-        # On first run, save state even without completions so we don't repeat the initial print
-        if first_run:
-            provider_state_data["last_check"] = datetime.now(timezone.utc).isoformat()
-            save_state(state)
         return
 
-    logger.info("[%s] %d item(s) newly completed \u2013 sending email \u2026",
-                provider.name, len(newly_completed))
+    logger.info("[%s] %d item(s) newly completed \u2013 sending email \u2026", provider.name, len(newly_completed))
+
+    day_label = provider.get_day_label(data)
+    
     if not first_run:
-        logger.info("%s", provider.format_text(items, provider.heading(day_label)))
+        logger.info("%s", provider.items_to_plain_table(completed_items, provider.heading(day_label)))
 
     subject = f"{provider.name} Update \u2013 {day_label}"
     html_body = (
         f"<h2>{provider.heading(day_label)}</h2>"
-        + provider.items_to_html_table(items)
+        + provider.items_to_html_table(completed_items)
         + "<br><p style='color:gray;font-size:12px;'>Sent by Scraper Agent</p>"
     )
-    plain_body = provider.format_text(items, provider.heading(day_label))
+    plain_body = provider.items_to_plain_table(completed_items, provider.heading(day_label))
     send_email(subject, html_body, plain_body)
 
     # Update state only when new completions are found
