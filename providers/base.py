@@ -78,3 +78,31 @@ class Provider(ABC):
             sections.append("-" * 100)
         sections.append("=" * 100)
         return "\n".join(sections)
+
+    def notified_ids_state_key(self) -> str:
+        """state.json key used for notification bookkeeping.
+
+        The agent loop stores IDs that were already notified about under this key.
+        """
+        return "notified_ids"
+
+    # ------------------------------------------------------------------
+    # Optional hooks
+    # ------------------------------------------------------------------
+    def evaluated_ids_state_key(self) -> str | None:
+        """Optional state.json key to track all evaluated item IDs (even if filtered out).
+
+        If provided, the agent loop can avoid re-processing expensive items (e.g. LLM calls)
+        by only processing IDs that are unevaluated relative to this state.
+        """
+        return None
+
+    def process_unevaluated_items(self, items: list[dict], unevaluated_ids: set[str]) -> tuple[list[dict], set[str]]:
+        """Optional hook to process only unevaluated items.
+
+        Returns:
+        - notify_items: items that should proceed to the normal notification pipeline
+        - evaluated_ids_to_add: IDs that should be added to the evaluated set
+        """
+        notify_items = [it for it in items if str(it.get("id")) in unevaluated_ids]
+        return notify_items, set(unevaluated_ids)

@@ -5,7 +5,8 @@ venv/
 .env
 
 # Runtime state
-state.json
+state.ynet-sport.json
+state.espn-nba.json
 
 # Python
 __pycache__/

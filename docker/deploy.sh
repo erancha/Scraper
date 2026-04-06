@@ -3,7 +3,7 @@ set -eu
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   cat <<'USAGE'
-Usage: ./docker/deploy.sh [--dockerhub] [loop|once] [--help]
+Usage: ./docker/deploy.sh [--dockerhub] [loop|once] [scraper args...]
 
 Runs the scraper container.
   - Default is local deploy (uses local image; builds if missing).
@@ -11,6 +11,10 @@ Runs the scraper container.
 
 Positional arguments:
   loop|once   Defaults to loop
+
+Additional arguments:
+  Any extra arguments are passed through to `python scraper.py ...` inside the container.
+  Example: ./docker/deploy.sh loop --all
 
 Environment variables:
   IMAGE_NAME            scraper (default)
@@ -27,6 +31,7 @@ Environment variables:
 Examples:
   ./docker/deploy.sh
   ./docker/deploy.sh once
+  ./docker/deploy.sh loop --all
   ./docker/deploy.sh --dockerhub
 USAGE
   exit 0
@@ -39,6 +44,8 @@ if [ "${1:-}" = "--dockerhub" ]; then
 fi
 
 MODE="${1:-loop}"  # loop|once
+shift || true
+EXTRA_ARGS="$@"
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
@@ -133,4 +140,4 @@ docker run -d \
   $STATE_ENV_ARG \
   $STATE_VOL_ARG \
   "$FULL_IMAGE" \
-  python scraper.py "$MODE"
+  python scraper.py "$MODE" $EXTRA_ARGS

@@ -47,6 +47,9 @@ Pulls `<dockerhub-namespace>/<IMAGE_NAME>:<TAG>` from Docker Hub and runs the co
 
 ```sh
 ./docker/deploy.sh --dockerhub
+
+# start all providers (recommended):
+./docker/deploy.sh --dockerhub loop --all
 ```
 
 For a public image, pulling does not require a token. If the repo is private (or you want explicit auth), set `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` in `.env`.

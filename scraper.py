@@ -14,11 +14,13 @@ import json
 import logging
 import os
 import smtplib
+import subprocess
 import time
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+import re
 
 import requests
 from dotenv import load_dotenv
@@ -28,12 +30,19 @@ from providers.base import Provider
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+_log_level_name = (os.getenv("LOG_LEVEL", "INFO") or "INFO").strip()
+_log_level_name = _log_level_name.split("#", 1)[0].strip().upper()
+LOG_LEVEL = getattr(logging, _log_level_name, logging.INFO)
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -53,6 +62,10 @@ DRY_RUN = False  # Set via --dry-run CLI flag; skips actual email sending
 # This prevents duplicate emails: an event is only emailed about once, the first time it appears as completed.
 # State is keyed per source (e.g. state["espn_nba"]["completed_ids"]) so multiple sources coexist cleanly.
 # -------------------------------------------------------------------------------------------------------------------------------
+def _state_file_for_provider(provider_key: str) -> Path:
+    suffix = re.sub(r"[^a-zA-Z0-9._-]+", "_", provider_key.strip())
+    return STATE_FILE.with_name(f"{STATE_FILE.stem}.{suffix}{STATE_FILE.suffix}")
+
 def load_state() -> dict:
     """Return the full persisted state dict."""
     if STATE_FILE.exists():
@@ -70,7 +83,12 @@ def provider_state(state: dict, provider: Provider) -> dict:
     """Return (or create) the sub-dict for a given provider inside the global state."""
     key = provider.state_key
     if key not in state:
-        state[key] = {"completed_ids": [], "last_check": None}
+        # Initialize per-provider state on first run (notified/evaluated IDs + last check timestamp).
+        provider_state_data = {provider.notified_ids_state_key(): [], "last_check": None}
+        evaluated_key = provider.evaluated_ids_state_key()
+        if evaluated_key:
+            provider_state_data[evaluated_key] = []
+        state[key] = provider_state_data
     return state[key]
 
 
@@ -114,48 +132,58 @@ def check_once(provider: Provider) -> None:
     """Run a single scrape-check-email cycle for the given provider."""
     state = load_state()
     provider_state_data = provider_state(state, provider)
-    known_completed: set[str] = set(provider_state_data.get("completed_ids", []))
+    notified_key = provider.notified_ids_state_key()
+    known_notified_ids: set[str] = set(provider_state_data.get(notified_key, []))
 
     data = provider.fetch()
     items = provider.parse(data)
 
-    current_completed = provider.get_completed_ids(items)
-    completed_items = [item for item in items if str(item.get("id")) in current_completed]
+    evaluated_key = provider.evaluated_ids_state_key()
+    if evaluated_key:
+        known_evaluated_ids: set[str] = set(provider_state_data.get(evaluated_key, []))
+        current_ids = {str(i.get("id")) for i in items if i.get("id")} # a set of the IDs currently present in this scrape, normalized to strings
+        unevaluated_ids = current_ids - known_evaluated_ids # IDs that are present now but were not previously recorded as evaluated
+        items, evaluated_ids_to_add = provider.process_unevaluated_items(items, unevaluated_ids)
+        provider_state_data[evaluated_key] = list(known_evaluated_ids | evaluated_ids_to_add)
+        save_state(state)
+
+    current_completed_ids = provider.get_completed_ids(items)
+    current_completed_items = [item for item in items if str(item.get("id")) in current_completed_ids]
 
     first_run = provider_state_data.get("last_check") is None
     if first_run:
         provider_state_data["last_check"] = datetime.now(timezone.utc).isoformat()
         save_state(state)
 
-    if not completed_items:
+    if not current_completed_items:
         return
 
     # ---- Completion evaluation ----
     # Compare the set of completed IDs from this fetch against the IDs stored in state.json.
-    # An email is sent ONLY when at least one new ID appears in the completed set that wasn't there before.
-    newly_completed = current_completed - known_completed
+    # An email should be sent ONLY when at least one new ID appears in the completed set that wasn't there before.
+    newly_ids_to_be_notified = current_completed_ids - known_notified_ids
 
-    if not newly_completed:
+    if not newly_ids_to_be_notified:
         return
 
-    logger.info("[%s] %d item(s) newly completed \u2013 sending email \u2026", provider.name, len(newly_completed))
+    logger.info("[%s] %d item(s) newly notified \u2013 sending email \u2026", provider.name, len(newly_ids_to_be_notified))
 
     day_label = provider.get_day_label(data)
     
     if not first_run:
-        logger.info("%s", provider.items_to_plain_table(completed_items, provider.heading(day_label)))
+        logger.info("%s", provider.items_to_plain_table(current_completed_items, provider.heading(day_label)))
 
     subject = f"{provider.name} Update \u2013 {day_label}"
     html_body = (
         f"<h2>{provider.heading(day_label)}</h2>"
-        + provider.items_to_html_table(completed_items)
+        + provider.items_to_html_table(current_completed_items)
         + "<br><p style='color:gray;font-size:12px;'>Sent by Scraper Agent</p>"
     )
-    plain_body = provider.items_to_plain_table(completed_items, provider.heading(day_label))
+    plain_body = provider.items_to_plain_table(current_completed_items, provider.heading(day_label))
     send_email(subject, html_body, plain_body)
 
     # Update state only when new completions are found
-    provider_state_data["completed_ids"] = list(known_completed | current_completed)
+    provider_state_data[notified_key] = list(known_notified_ids | current_completed_ids)
     provider_state_data["last_check"] = datetime.now(timezone.utc).isoformat()
     save_state(state)
 
@@ -177,6 +205,46 @@ def run_loop(provider: Provider) -> None:
         time.sleep(sleep_secs)
 
 
+def _spawn_provider_process(provider_key: str, mode: str) -> subprocess.Popen:
+    script_path = str(Path(__file__).resolve())
+    cmd = [sys.executable, script_path, mode, "--provider", provider_key]
+
+    env = os.environ.copy()
+    env["STATE_FILE"] = os.environ.get("STATE_FILE") or str(Path(__file__).parent / "state.json")
+    return subprocess.Popen(cmd, env=env)
+
+
+def run_all_isolated(mode: str) -> int:
+    provider_keys = list(PROVIDERS.keys())
+    logger.info("Starting %d isolated provider process(es): %s", len(provider_keys), ", ".join(provider_keys))
+
+    procs: list[tuple[str, subprocess.Popen]] = []
+    for key in provider_keys:
+        procs.append((key, _spawn_provider_process(key, mode=mode)))
+
+    try:
+        while True:
+            time.sleep(1)
+            for key, p in procs:
+                rc = p.poll()
+                if rc is not None:
+                    logger.error("Provider '%s' exited unexpectedly with code %s", key, rc)
+                    return rc
+    except KeyboardInterrupt:
+        logger.info("Stopping all provider processes ...")
+        for _, p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        for _, p in procs:
+            try:
+                p.wait(timeout=10)
+            except Exception:
+                pass
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -187,6 +255,11 @@ if __name__ == "__main__":
         args.remove("--dry-run")
         logger.info("[DRY-RUN] Email sending disabled.")
 
+    run_all = False
+    if "--all" in args:
+        run_all = True
+        args.remove("--all")
+
     # --provider <key>  (default: espn-nba)
     provider_key = DEFAULT_PROVIDER_KEY
     if "--provider" in args:
@@ -194,17 +267,34 @@ if __name__ == "__main__":
         provider_key = args[idx + 1]
         del args[idx:idx + 2]
 
+    if provider_key == "all":
+        run_all = True
+
+    mode = args[0] if args else "loop"
+
+    if mode not in {"once", "loop"}:
+        logger.error("Usage: %s [once|loop] [--dry-run] [--provider <key>|all] [--all]", sys.argv[0])
+        logger.error("Available providers: %s", ', '.join(PROVIDERS))
+        sys.exit(1)
+
+    if run_all:
+        if mode == "once" or DRY_RUN:
+            if mode == "once":
+                logger.error("'once' mode is intended for per-provider testing. Use: %s once --provider <key>", sys.argv[0])
+            else:
+                logger.error("'--dry-run' is intended for per-provider testing. Use: %s %s --provider <key> --dry-run", sys.argv[0], mode)
+            sys.exit(1)
+        sys.exit(run_all_isolated(mode=mode))
+
     if provider_key not in PROVIDERS:
         logger.error("Unknown provider '%s'. Available: %s", provider_key, ', '.join(PROVIDERS))
         sys.exit(1)
+
+    # Make per-provider state files the default even when running a single provider.
+    STATE_FILE = _state_file_for_provider(provider_key)
     active_provider = PROVIDERS[provider_key]
 
-    mode = args[0] if args else "loop"
     if mode == "once":
         check_once(active_provider)
-    elif mode == "loop":
-        run_loop(active_provider)
     else:
-        logger.error("Usage: %s [once|loop] [--dry-run] [--provider <key>]", sys.argv[0])
-        logger.error("Available providers: %s", ', '.join(PROVIDERS))
-        sys.exit(1)
+        run_loop(active_provider)

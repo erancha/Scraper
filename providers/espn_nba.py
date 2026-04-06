@@ -206,7 +206,7 @@ class EspnNba(Provider):
         for t in g["teams"]:
             for ldr in t.get("leaders", []):
                 lines.append(
-                    f"  {t['abbreviation']} - {ldr['player']} #{ldr['jersey']}  "
+                    f"  {t['abbreviation']} - {ldr['player']}  "
                     f"{ldr['category']}: {ldr['value']}"
                 )
 
@@ -235,7 +235,7 @@ class EspnNba(Provider):
                 parts = []
                 for ldr in team.get("leaders", []):
                     parts.append(
-                        f"{ldr['player']} #{ldr['jersey']} \u2013 "
+                        f"{ldr['player']} \u2013 "
                         f"{ldr['category']}: {ldr['value']}"
                     )
                 return "<br>".join(parts)

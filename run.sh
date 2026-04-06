@@ -16,8 +16,11 @@ source venv/bin/activate
 #   Examples:
 #     ./run.sh once --dry-run
 #     ./run.sh loop --provider espn-nba
-MODE="${1:-loop}"
-shift 2>/dev/null || true
+MODE="loop"
+if [ "${1:-}" = "once" ] || [ "${1:-}" = "loop" ]; then
+    MODE="$1"
+    shift
+fi
 
 echo "=== Scraper Agent – mode: $MODE $* ==="
 python3 scraper.py "$MODE" "$@"
