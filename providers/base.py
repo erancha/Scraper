@@ -60,6 +60,10 @@ class Provider(ABC):
     # ------------------------------------------------------------------
     # Default implementations (can be overridden)
     # ------------------------------------------------------------------
+    def is_rtl(self) -> bool:
+        """Whether this provider's human-facing output should be rendered RTL."""
+        return False
+
     def fetch(self) -> dict:
         """Fetch raw JSON data from self.url. Override for non-JSON APIs."""
         resp = requests.get(self.url, timeout=30)
@@ -68,7 +72,15 @@ class Provider(ABC):
 
     def heading(self, day_label: str) -> str:
         """Display heading for output/emails. Override for custom labels."""
-        return f"{self.name} \u2013 {day_label}"
+        if not self.is_rtl():
+            return f"{self.name} \u2013 {day_label}"
+
+        # Use bidi isolates so mixed RTL/LTR content (e.g. Hebrew name + numeric date)
+        # keeps the dash and ordering stable in terminals and emails.
+        rli = "\u2067"  # Right-to-Left Isolate
+        lri = "\u2066"  # Left-to-Right Isolate
+        pdi = "\u2069"  # Pop Directional Isolate
+        return f"{rli}{self.name}{pdi} \u2013 {lri}{day_label}{pdi}"
 
     def items_to_plain_table(self, items: list[dict], heading: str) -> str:
         """All items as plain text. Override for custom layout."""
