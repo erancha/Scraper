@@ -48,13 +48,26 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 STATE_FILE = Path(os.getenv("STATE_FILE", str(Path(__file__).parent / "state.json")))
-EMAIL_TO = [addr.strip() for addr in os.getenv("EMAIL_TO", "").split(",") if addr.strip()]
+EMAIL_TO: list[str] = []
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # seconds between checks
 DRY_RUN = False  # Set via --dry-run CLI flag; skips actual email sending
+
+
+def _provider_env_key(provider_key: str) -> str:
+    # Convert provider keys like "espn-nba" into a safe env-var suffix: "ESPN_NBA".
+    return re.sub(r"[^a-zA-Z0-9]+", "_", provider_key.strip()).strip("_").upper()
+
+
+def _getenv_provider_scoped(name: str, provider_key: str) -> str:
+    # Resolution order:
+    # - <NAME>__<PROVIDER_ENV_KEY> (e.g. EMAIL_TO__ESPN_NBA)
+    # - <NAME> (global default)
+    scoped = f"{name}__{_provider_env_key(provider_key)}"
+    return (os.getenv(scoped) or os.getenv(name) or "").strip()
 
 
 # -------------------------------------------------------------------------------------------------------------------------------
@@ -290,6 +303,13 @@ if __name__ == "__main__":
     if provider_key not in PROVIDERS:
         logger.error("Unknown provider '%s'. Available: %s", provider_key, ', '.join(PROVIDERS))
         sys.exit(1)
+
+    # Resolve recipient list after provider selection (supports provider-scoped overrides).
+    EMAIL_TO = [
+        addr.strip()
+        for addr in _getenv_provider_scoped("EMAIL_TO", provider_key).split(",")
+        if addr.strip()
+    ]
 
     # Make per-provider state files the default even when running a single provider.
     STATE_FILE = _state_file_for_provider(provider_key)
