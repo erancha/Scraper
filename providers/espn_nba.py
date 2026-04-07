@@ -309,18 +309,28 @@ class EspnNba(Provider):
             recap_url = g.get("recapUrl") or ""
             recap_summary = (g.get("recapSummary") or "").replace("<", "&lt;").replace(">", "&gt;")
 
-            # Build per-team leader summaries for the email
-            def leaders_html(team: dict) -> str:
+            # Build per-team leader summaries for the email (single-line each team)
+            def leaders_inline(team: dict) -> str:
                 parts = []
                 for ldr in team.get("leaders", []):
                     parts.append(
                         f"{ldr['player']} \u2013 "
                         f"{ldr['category']}: {ldr['value']}"
                     )
-                return "<br>".join(parts)
+                return " | ".join(parts)
 
-            away_leaders = leaders_html(away)
-            home_leaders = leaders_html(home)
+            away_leaders = leaders_inline(away)
+            home_leaders = leaders_inline(home)
+            leaders_row_html = ""
+            if away_leaders or home_leaders:
+                away_prefix = away.get("abbreviation") or away.get("name") or "Away"
+                home_prefix = home.get("abbreviation") or home.get("name") or "Home"
+                leaders_row_html = (
+                    "<tr><td colspan='7' style='font-size:12px;line-height:1.35'>"
+                    f"<b>{away_prefix}</b>: {away_leaders}<br>"
+                    f"<b>{home_prefix}</b>: {home_leaders}"
+                    "</td></tr>"
+                )
 
             rows.append(
                 f"<tr>"
@@ -329,13 +339,12 @@ class EspnNba(Provider):
                 f"<td style='text-align:center;font-weight:bold'>{away.get('score', '-')}</td>"
                 f"<td style='text-align:center;font-weight:bold'>{home.get('score', '-')}</td>"
                 f"<td>{home['name']} ({home['record']})</td>"
-                f"<td style='font-size:12px'>{away_leaders}</td>"
-                f"<td style='font-size:12px'>{home_leaders}</td>"
                 f"<td>{g.get('venue', '')}<br><span style='color:gray;font-size:11px'>"
                 f"({home['abbreviation']} home)</span></td>"
                 f"<td><a href='{box_score_url}'>Box Score</a>" + (f"<br><a href='{recap_url}'>Recap</a>" if recap_url else "") + "</td>"
                 f"</tr>"
-                + (f"<tr><td colspan='9' dir='rtl' style='direction:rtl;text-align:right;font-size:13px;line-height:1.35;color:#222'>{recap_summary}</td></tr>" if recap_summary else "")
+                + (f"<tr><td colspan='7' dir='rtl' style='direction:rtl;text-align:right;font-size:13px;line-height:1.35;color:#222'>{recap_summary}</td></tr>" if recap_summary else "")
+                + leaders_row_html
             )
 
         games_table = (
@@ -343,8 +352,7 @@ class EspnNba(Provider):
             "style='border-collapse:collapse;font-family:Arial,sans-serif;'>"
             "<tr style='background:#1a1a2e;color:#fff;'>"
             "<th>Time</th><th>Away</th><th>Score</th><th>Score</th>"
-            "<th>Home</th><th>Away Leaders</th><th>Home Leaders</th>"
-            "<th>Venue</th><th>Box Score</th></tr>"
+            "<th>Home</th><th>Venue</th><th>Box Score</th></tr>"
             + "\n".join(rows)
             + "</table>"
         )
