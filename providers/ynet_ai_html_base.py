@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
-import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
@@ -246,42 +243,6 @@ class YnetAiHtmlProviderBase(Provider, ABC):
             + "</tbody></table>"
         )
 
-    def _openai_api_key(self) -> str:
-        return (os.getenv("OPENAI_API_KEY") or "").strip()
-
-    def _openai_model(self) -> str:
-        raw = (os.getenv("OPENAI_MODEL") or "").strip()
-        if raw:
-            raw = raw.split("#", 1)[0].strip()
-        return raw or "gpt-4o-mini"
-
-    def _estimate_openai_cost_usd(self, model: str, prompt_tokens: int, completion_tokens: int) -> float:
-        input_per_1m_override = (os.getenv("OPENAI_INPUT_COST_PER_1M") or "").strip()
-        output_per_1m_override = (os.getenv("OPENAI_OUTPUT_COST_PER_1M") or "").strip()
-
-        def _to_float(v: str) -> float | None:
-            try:
-                return float(v)
-            except Exception:
-                return None
-
-        input_per_1m = _to_float(input_per_1m_override)
-        output_per_1m = _to_float(output_per_1m_override)
-
-        if input_per_1m is None or output_per_1m is None:
-            pricing_per_1m = {
-                "gpt-4o-mini": (0.15, 0.60),
-                "gpt-4o": (5.00, 15.00),
-            }
-            pricing_model = model if model in pricing_per_1m else "gpt-4o-mini"
-            default_in, default_out = pricing_per_1m[pricing_model]
-            if input_per_1m is None:
-                input_per_1m = default_in
-            if output_per_1m is None:
-                output_per_1m = default_out
-
-        return (prompt_tokens / 1_000_000.0) * float(input_per_1m) + (completion_tokens / 1_000_000.0) * float(output_per_1m)
-
     def openai_system_prompt(self) -> str:
         return "Return ONLY valid JSON with keys: summary (string)."
 
@@ -309,143 +270,6 @@ class YnetAiHtmlProviderBase(Provider, ABC):
             f"{text_label}: {text}"
         )
 
-    def _openai_analyze_article(self, title: str, url: str, text: str) -> dict:
-        api_key = self._openai_api_key()
-        if not api_key:
-            return {}
-
-        cached = self._analysis_cache.get(url)
-        if cached is not None:
-            return cached
-
-        model = self._openai_model()
-        if self._last_logged_openai_model != model:
-            logger.info("[%s] OpenAI model=%s", self.name, model)
-            self._last_logged_openai_model = model
-
-        system = self.openai_system_prompt()
-        user = self.openai_user_prompt(title=title, url=url, text=text)
-
-        openai_timeout_s = 60
-        t0 = time.monotonic()
-
-        def _log_openai_request_exception(prefix: str, exc: requests.exceptions.RequestException) -> None:
-            elapsed_s = time.monotonic() - t0
-            logger.warning(
-                "[%s] OpenAI %s after %0.3fs url=%s model=%s (%s)",
-                self.name,
-                prefix,
-                elapsed_s,
-                url,
-                model,
-                exc.__class__.__name__,
-                exc_info=True,
-            )
-
-        try:
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                timeout=openai_timeout_s,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "temperature": 0,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "response_format": {"type": "json_object"},
-                },
-            )
-        except requests.exceptions.Timeout as exc:
-            elapsed_s = time.monotonic() - t0
-            logger.warning(
-                "[%s] OpenAI request timed out after %0.3fs (timeout=%ss) url=%s model=%s system_len=%d user_len=%d text_len=%d",
-                self.name,
-                elapsed_s,
-                openai_timeout_s,
-                url,
-                model,
-                len(system or ""),
-                len(user or ""),
-                len(text or ""),
-                exc_info=True,
-            )
-            raise
-        except requests.exceptions.ConnectionError as exc:
-            _log_openai_request_exception("connection error", exc)
-            raise
-        except requests.exceptions.RequestException as exc:
-            _log_openai_request_exception("request error", exc)
-            raise
-
-        elapsed_s = time.monotonic() - t0
-        if not resp.ok:
-            body_preview = (resp.text or "").strip()
-            if len(body_preview) > 2000:
-                body_preview = body_preview[:2000] + "..."
-            openai_request_id = resp.headers.get("x-request-id") or resp.headers.get("request-id") or ""
-            if openai_request_id:
-                openai_request_id = openai_request_id.strip()
-            logger.warning(
-                "[%s] OpenAI HTTP %s after %0.3fs for %s (request_id=%s): %s",
-                self.name,
-                resp.status_code,
-                elapsed_s,
-                url,
-                openai_request_id,
-                body_preview,
-            )
-            resp.raise_for_status()
-
-        payload = resp.json()
-
-        usage = payload.get("usage") or {}
-        prompt_tokens = int(usage.get("prompt_tokens") or 0)
-        completion_tokens = int(usage.get("completion_tokens") or 0)
-        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
-        est_cost_usd = self._estimate_openai_cost_usd(model, prompt_tokens, completion_tokens)
-
-        url_width = 70
-        url_display = url
-        if len(url_display) > url_width:
-            url_display = url_display[: url_width - 1] + "…"
-
-        logger.info(
-            "[%s] OpenAI usage for %-*s  prompt=%5d  completion=%5d  total=%5d  est_cost=$%0.6f",
-            self.name,
-            url_width,
-            url_display,
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-            est_cost_usd,
-        )
-
-        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
-        try:
-            parsed = json.loads(content) if content else {}
-        except Exception:
-            parsed = {}
-
-        if not isinstance(parsed, dict):
-            parsed = {}
-
-        result = dict(parsed)
-        result["usage"] = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "estimated_cost_usd": est_cost_usd,
-            "model": model,
-        }
-
-        self._analysis_cache[url] = result
-        return result
-
     def _fetch_article_soup(self, url: str) -> BeautifulSoup:
         resp = requests.get(
             url,
@@ -462,13 +286,7 @@ class YnetAiHtmlProviderBase(Provider, ABC):
         return BeautifulSoup(resp.text, "html.parser")
 
     def _extract_article_text(self, soup: BeautifulSoup) -> str:
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-
-        article = soup.find("article")
-        container = article if article is not None else soup
-        text = container.get_text(" ", strip=True)
-        return " ".join(text.split())
+        return self._html_to_text(str(soup))
 
     def _extract_published_at(self, soup: BeautifulSoup) -> str:
         for script in soup.find_all("script"):

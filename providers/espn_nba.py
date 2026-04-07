@@ -15,6 +15,10 @@ from .base import Provider
 class EspnNba(Provider):
     """Scrapes the ESPN NBA scoreboard via their public JSON API."""
 
+    def __init__(self) -> None:
+        self._analysis_cache: dict[str, dict] = {}
+        self._last_logged_openai_model: str | None = None
+
     # -- Provider identity ---------------------------------------------------
 
     @property
@@ -140,13 +144,79 @@ class EspnNba(Provider):
                 game["tickets"] = ""
                 game["ticketLink"] = ""
 
+            game_id = str(game.get("id") or "")
+            game["recapUrl"] = (
+                f"https://www.espn.com/nba/recap/_/gameId/{game_id}"
+                if game_id
+                else ""
+            )
+
             games.append(game)
         return games
+
+    def openai_summary_instruction(self) -> str:
+        return "Write a concise 3-5 sentence recap summary in Hebrew."
+
+    def _openai_max_recap_chars(self) -> int:
+        return 8000
+
+    def _fetch_recap_summary(self, game: dict) -> str:
+        recap_url = str(game.get("recapUrl") or "").strip()
+        if not recap_url:
+            return ""
+
+        if not self._openai_api_key():
+            return ""
+
+        try:
+            resp = requests.get(
+                recap_url,
+                timeout=30,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/123.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+            resp.raise_for_status()
+        except Exception:
+            return ""
+
+        text = self._html_to_text(resp.text)
+        if not text:
+            return ""
+
+        max_chars = int(self._openai_max_recap_chars() or 0)
+        if max_chars > 0 and len(text) > max_chars:
+            text = text[:max_chars]
+
+        title = str(game.get("name") or "NBA game")
+        analysis = self._openai_analyze_article(title=title, url=recap_url, text=text)
+        summary = (analysis.get("summary") or "").strip() if isinstance(analysis, dict) else ""
+        return summary
+
+    def process_unevaluated_items(self, items: list[dict], unevaluated_ids: set[str]) -> tuple[list[dict], set[str]]:
+        notify_items = [it for it in items if str(it.get("id")) in unevaluated_ids]
+        for g in notify_items:
+            if str(g.get("status_id")) != "3":
+                continue
+            try:
+                summary = self._fetch_recap_summary(g)
+            except Exception:
+                summary = ""
+            if summary:
+                g["recapSummary"] = summary
+        return notify_items, set(unevaluated_ids)
 
     # -- Completion detection ------------------------------------------------
 
     def get_day_label(self, data: dict) -> str:
         return data.get("day", {}).get("date", "today")
+
+    def evaluated_ids_state_key(self) -> str | None:
+        return "evaluated_ids"
 
     def get_completed_ids(self, items: list[dict]) -> set[str]:
         """status_id '3' means Final in ESPN's API."""
@@ -210,6 +280,13 @@ class EspnNba(Provider):
                     f"{ldr['category']}: {ldr['value']}"
                 )
 
+        recap_summary = (g.get("recapSummary") or "").strip()
+        if recap_summary:
+            rli = "\u2067"  # Right-to-Left Isolate
+            pdi = "\u2069"  # Pop Directional Isolate
+            lines.append("")
+            lines.append(f"{rli}{recap_summary}{pdi}")
+
         return "\n".join(lines)
 
     def items_to_html_table(self, items: list[dict]) -> str:
@@ -229,6 +306,8 @@ class EspnNba(Provider):
                 time_str = dt
 
             box_score_url = f"https://www.espn.com/nba/boxscore/_/gameId/{g['id']}"
+            recap_url = g.get("recapUrl") or ""
+            recap_summary = (g.get("recapSummary") or "").replace("<", "&lt;").replace(">", "&gt;")
 
             # Build per-team leader summaries for the email
             def leaders_html(team: dict) -> str:
@@ -254,8 +333,9 @@ class EspnNba(Provider):
                 f"<td style='font-size:12px'>{home_leaders}</td>"
                 f"<td>{g.get('venue', '')}<br><span style='color:gray;font-size:11px'>"
                 f"({home['abbreviation']} home)</span></td>"
-                f"<td><a href='{box_score_url}'>Box Score</a></td>"
+                f"<td><a href='{box_score_url}'>Box Score</a>" + (f"<br><a href='{recap_url}'>Recap</a>" if recap_url else "") + "</td>"
                 f"</tr>"
+                + (f"<tr><td colspan='9' dir='rtl' style='direction:rtl;text-align:right;font-size:13px;line-height:1.35;color:#222'>{recap_summary}</td></tr>" if recap_summary else "")
             )
 
         games_table = (
