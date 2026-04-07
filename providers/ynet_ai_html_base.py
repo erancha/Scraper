@@ -6,7 +6,7 @@ import os
 import re
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -43,6 +43,10 @@ class YnetAiHtmlProviderBase(Provider, ABC):
     @property
     def min_title_len(self) -> int:
         return 10
+
+    @property
+    def days_back(self) -> int:
+        return 1
 
     def is_rtl(self) -> bool:
         return True
@@ -120,12 +124,31 @@ class YnetAiHtmlProviderBase(Provider, ABC):
             if not url:
                 continue
 
+            cutoff_dt = datetime.now() - timedelta(days=int(self.days_back or 0))  # Keep only items newer than this rolling cutoff (resolution: days; comparison uses local time down to seconds).
+
             try:
                 logger.debug("[%s] Fetching article: %s", self.name, url)
                 soup = self._fetch_article_soup(url)
                 published_at = self._extract_published_at(soup)
                 if published_at:
                     it["published_at"] = published_at
+                    # Keep only items newer than cutoff_dt:
+                    try:
+                        dt_raw = str(published_at).strip().replace("Z", "+00:00")
+                        published_dt = datetime.fromisoformat(dt_raw)
+                        if published_dt.tzinfo is not None:
+                            published_dt = published_dt.astimezone().replace(tzinfo=None)
+                        if published_dt < cutoff_dt:
+                            logger.debug(
+                                "[%s] Filtered out (too old): %s published_at=%s cutoff=%s",
+                                self.name,
+                                url,
+                                published_at,
+                                cutoff_dt.isoformat(timespec="seconds"),
+                            )
+                            continue
+                    except Exception:
+                        pass
                 text = self._extract_article_text(soup)
             except Exception as exc:
                 logger.warning("[%s] Failed to fetch article: %s (%s)", self.name, url, exc)
