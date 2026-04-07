@@ -66,6 +66,7 @@ def _state_file_for_provider(provider_key: str) -> Path:
     suffix = re.sub(r"[^a-zA-Z0-9._-]+", "_", provider_key.strip())
     return STATE_FILE.with_name(f"{STATE_FILE.stem}.{suffix}{STATE_FILE.suffix}")
 
+
 def load_state() -> dict:
     """Return the full persisted state dict."""
     if STATE_FILE.exists():

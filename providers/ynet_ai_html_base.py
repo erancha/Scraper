@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
@@ -136,7 +137,13 @@ class YnetAiHtmlProviderBase(Provider, ABC):
                     logger.debug("[%s] Summarizing/classifying via OpenAI: %s", self.name, url)
                     analysis = self._openai_analyze_article(title=title, url=url, text=text)
                 except Exception as exc:
-                    logger.warning("[%s] OpenAI analysis failed: %s (%s)", self.name, url, exc)
+                    logger.warning(
+                        "[%s] OpenAI analysis failed: %s (%s)",
+                        self.name,
+                        url,
+                        exc.__class__.__name__,  # Keep the exception type in the log line for quick filtering/alerting.
+                        exc_info=True,  # Include traceback to diagnose rare network/provider failures.
+                    )
                     analysis = {}
 
             if not self.is_relevant(title=title, url=url, text=text, analysis=analysis):
@@ -296,32 +303,77 @@ class YnetAiHtmlProviderBase(Provider, ABC):
         system = self.openai_system_prompt()
         user = self.openai_user_prompt(title=title, url=url, text=text)
 
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            timeout=60,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "temperature": 0,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "response_format": {"type": "json_object"},
-            },
-        )
+        openai_timeout_s = 60
+        t0 = time.monotonic()
+
+        def _log_openai_request_exception(prefix: str, exc: requests.exceptions.RequestException) -> None:
+            elapsed_s = time.monotonic() - t0
+            logger.warning(
+                "[%s] OpenAI %s after %0.3fs url=%s model=%s (%s)",
+                self.name,
+                prefix,
+                elapsed_s,
+                url,
+                model,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
+
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                timeout=openai_timeout_s,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "temperature": 0,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "response_format": {"type": "json_object"},
+                },
+            )
+        except requests.exceptions.Timeout as exc:
+            elapsed_s = time.monotonic() - t0
+            logger.warning(
+                "[%s] OpenAI request timed out after %0.3fs (timeout=%ss) url=%s model=%s system_len=%d user_len=%d text_len=%d",
+                self.name,
+                elapsed_s,
+                openai_timeout_s,
+                url,
+                model,
+                len(system or ""),
+                len(user or ""),
+                len(text or ""),
+                exc_info=True,
+            )
+            raise
+        except requests.exceptions.ConnectionError as exc:
+            _log_openai_request_exception("connection error", exc)
+            raise
+        except requests.exceptions.RequestException as exc:
+            _log_openai_request_exception("request error", exc)
+            raise
+
+        elapsed_s = time.monotonic() - t0
         if not resp.ok:
             body_preview = (resp.text or "").strip()
             if len(body_preview) > 2000:
                 body_preview = body_preview[:2000] + "..."
+            openai_request_id = resp.headers.get("x-request-id") or resp.headers.get("request-id") or ""
+            if openai_request_id:
+                openai_request_id = openai_request_id.strip()
             logger.warning(
-                "[%s] OpenAI HTTP %s for %s: %s",
+                "[%s] OpenAI HTTP %s after %0.3fs for %s (request_id=%s): %s",
                 self.name,
                 resp.status_code,
+                elapsed_s,
                 url,
+                openai_request_id,
                 body_preview,
             )
             resp.raise_for_status()
