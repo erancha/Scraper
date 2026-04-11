@@ -8,6 +8,10 @@ then register it in providers/__init__.py.
 
 from abc import ABC, abstractmethod
 
+from datetime import datetime
+from datetime import timezone
+from datetime import timedelta
+
 import json
 import logging
 import os
@@ -31,7 +35,7 @@ class Provider(ABC):
     @property
     @abstractmethod
     def state_key(self) -> str:
-        """Unique key used to namespace this provider's data in state.json."""
+        """Unique key used to namespace this provider's data: state.<provider-key>.json."""
         ...
 
     @property
@@ -51,7 +55,7 @@ class Provider(ABC):
         ...
 
     @abstractmethod
-    def get_completed_ids(self, items: list[dict]) -> set[str]:
+    def get_only_completed_ids(self, items: list[dict]) -> set[str]:
         """Return the set of IDs for items that are finished/completed."""
         ...
 
@@ -99,33 +103,146 @@ class Provider(ABC):
         sections.append("=" * 100)
         return "\n".join(sections)
 
-    def notified_ids_state_key(self) -> str:
-        """state.json key used for notification bookkeeping.
+    def rejected_ids_state_key(self) -> str:
+        """state.<provider-key>.json key used for provider-level rejection bookkeeping.
 
-        The agent loop stores IDs that were already notified about under this key.
+        The agent loop stores IDs that should never be processed again under this key.
+        This includes:
+        - items rejected by provider filtering (e.g. too old / irrelevant)
+        """
+        return "rejected_ids"
+
+    def notified_ids_state_key(self) -> str:
+        """state.<provider-key>.json key used to store which item IDs have already been emailed.
+
+        This key is expected to contain a dict grouped by day, e.g.
+        {"YYYY-MM-DD": ["id1", "id2"]}.
         """
         return "notified_ids"
 
-    # ------------------------------------------------------------------
-    # Optional hooks
-    # ------------------------------------------------------------------
-    def evaluated_ids_state_key(self) -> str | None:
-        """Optional state.json key to track all evaluated item IDs (even if filtered out).
+    def record_notified_ids(self, newly_notified_items: list[dict], day_key: str) -> None:
+        """Persist newly_notified_items IDs under `notified_ids`, grouped by `day_key`.
 
-        If provided, the agent loop can avoid re-processing expensive items (e.g. LLM calls)
-        by only processing IDs that are unevaluated relative to this state.
+        The agent loop is responsible for calling this *after* an email is sent, and then saving state to disk.
         """
-        return None
+        notified_key = self.notified_ids_state_key()
+        state = self.provider_state
+        notified_ids_by_days = state.get(notified_key) # e.g. {"2026-04-10": ["id1","id2"], "2026-04-09": ["id3", "id4"]}
 
-    def process_unevaluated_items(self, items: list[dict], unevaluated_ids: set[str]) -> tuple[list[dict], set[str]]:
-        """Optional hook to process only unevaluated items.
+        if notified_ids_by_days is None:
+            notified_ids_by_days = {}
+
+        notified_ids_for_day = notified_ids_by_days.get(day_key) or []
+        notified_ids_for_day_set = {x for x in notified_ids_for_day} # Creates a set and implicitly dedupes
+        for it in newly_notified_items:
+            it_id = it.get("id")
+            notified_ids_for_day_set.add(str(it_id))
+
+        notified_ids_by_days[day_key] = sorted(notified_ids_for_day_set)
+        state[notified_key] = notified_ids_by_days
+
+    def prune_notified_ids_two_days_ago(self, today_utc: datetime) -> None:
+        """Delete the `notified_ids` bucket for two days ago (UTC).
+
+        Example: if today is 2026-04-10, remove the key "2026-04-08".
+        Intended to be called once a day (e.g. around end-of-day) to keep state bounded.
+
+        No-op when provider state is missing or `notified_ids` is not a day-grouped dict.
+
+        Time zone semantics:
+        - `today_utc` is expected to be **tz-aware UTC** (`datetime.now(timezone.utc)`).
+        - The computed day key uses `today_utc.date()` (i.e. the **UTC calendar day**, not local time).
+        """
+        state = self.provider_state
+        notified_ids_by_days = state.get(self.notified_ids_state_key())
+
+        cutoff_day_key = (today_utc.date() - timedelta(days=2)).isoformat()
+        if cutoff_day_key in notified_ids_by_days:
+            del notified_ids_by_days[cutoff_day_key]
+            logger.debug("[%s] prune_notified_ids_two_days_ago: removed day_key=%s", self.name, cutoff_day_key)
+        else:
+            logger.debug("[%s] prune_notified_ids_two_days_ago: nothing to remove (missing day_key=%s)", self.name, cutoff_day_key)
+
+    @property
+    def last_check_dt(self) -> datetime | None:
+        """Return `last_check` parsed from the attached provider state.
+
+        Time zone semantics:
+        - The return value is always a **naive UTC** `datetime` (tzinfo is stripped).
+        - If the stored value is tz-aware (e.g. ends with `Z`), it is converted to **UTC** first.
+        - If the stored value is tz-naive, it is treated as already being **UTC** (no local-time assumption).
+
+        Returns None when unavailable/unparseable.
+        """
+        state = self.provider_state
+        if not isinstance(state, dict):
+            return None
+
+        raw = state.get("last_check")
+        if not raw:
+            return None
+
+        try:
+            dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
+    @property
+    def provider_state(self) -> dict | None:
+        """Provider-local view of its persisted state dict (when attached by the agent loop)."""
+        return getattr(self, "_provider_state", None)
+
+    def attach_state(self, state: dict) -> None:
+        """Attach this provider's state dict for access to keys like `last_check`.
+        The agent loop owns persistence; providers only read this for runtime decisions such as computing `last_check_dt` / `cutoff_dt`.
+        """
+        self._provider_state = state
+
+    def cutoff_dt(self) -> datetime | None:
+        """Return the active datetime cutoff for time-based filtering.
+
+        Priority:
+        - provider_state['last_check'] (via last_check_dt)
+        - days_back rolling cutoff (if provider defines int days_back)
+        - None
+
+        Time zone semantics:
+        - When derived from `last_check_dt`, the cutoff is **naive UTC**.
+        - When derived from `days_back`, the cutoff uses `datetime.now()` which is **local time** and tz-naive.
+          (This is historical behavior; callers compare naive datetimes as-is.)
+        """
+        return self.last_check_dt or (
+            datetime.now() - timedelta(days=int(getattr(self, "days_back", 0) or 0))
+            if isinstance(getattr(self, "days_back", None), int)
+            else None
+        )
+
+    def reject_items(self, items: list[dict]) -> tuple[list[dict], set[str]]:
+        """Optional hook to filter items and record which IDs were rejected.
+
+        Args:
+            items: candidate items that are not already in rejected_ids.
 
         Returns:
-        - notify_items: items that should proceed to the normal notification pipeline
-        - evaluated_ids_to_add: IDs that should be added to the evaluated set
+            (items_to_keep, rejected_ids_to_save)
+
+            - items_to_keep: items that should continue through the pipeline.
+            - rejected_ids_to_save: IDs to persist to rejected_ids so they are not
+              processed again in future runs.
         """
-        notify_items = [it for it in items if str(it.get("id")) in unevaluated_ids]
-        return notify_items, set(unevaluated_ids)
+        return items, set()
+
+    def enrich_completed_items(self, items: list[dict]) -> list[dict]:
+        """Optional hook to enrich/mutate items before rejection/completion logic.
+
+        This hook should not filter items out (use reject_items for that). 
+        It is useful for adding derived fields, fetching summaries, etc.
+        """
+        return items
 
     def _openai_api_key(self) -> str:
         return (os.getenv("OPENAI_API_KEY") or "").strip()
@@ -137,10 +254,12 @@ class Provider(ABC):
         return raw or "gpt-4o-mini"
 
     def _estimate_openai_cost_usd(self, model: str, prompt_tokens: int, completion_tokens: int) -> float:
+        """Estimate OpenAI request cost in USD based on token usage and configured pricing overrides."""
         input_per_1m_override = (os.getenv("OPENAI_INPUT_COST_PER_1M") or "").strip()
         output_per_1m_override = (os.getenv("OPENAI_OUTPUT_COST_PER_1M") or "").strip()
 
         def _to_float(v: str) -> float | None:
+            """Parse a float from a string (returns None on failure)."""
             try:
                 return float(v)
             except Exception:
@@ -164,18 +283,23 @@ class Provider(ABC):
         return (prompt_tokens / 1_000_000.0) * float(input_per_1m) + (completion_tokens / 1_000_000.0) * float(output_per_1m)
 
     def openai_system_prompt(self) -> str:
+        """OpenAI system prompt used when summarizing/classifying content."""
         return "Return ONLY valid JSON with keys: summary (string)."
 
     def openai_user_prompt_prefix(self) -> str:
+        """Optional extra instruction prepended to the user prompt."""
         return ""
 
     def openai_summary_instruction(self) -> str:
+        """Instruction describing the desired summary style/language."""
         return "Write a concise 3-5 sentence summary."
 
     def openai_article_text_label(self) -> str:
+        """Label used for the article text section inside the user prompt."""
         return "Text"
 
     def openai_user_prompt(self, title: str, url: str, text: str) -> str:
+        """Build the OpenAI user prompt for a given piece of content."""
         prefix = (self.openai_user_prompt_prefix() or "").strip()
         if prefix:
             prefix = prefix + "\n\n"
@@ -190,19 +314,21 @@ class Provider(ABC):
             f"{text_label}: {text}"
         )
 
+    # def _openai_analyze_article(self, title: str, url: str, text: str) -> dict:
+    #     """For testing purposes."""
+    #     return {
+    #         "title": title,
+    #         "summary": (text or "")[:500],
+    #     }
+
     def _openai_analyze_article(self, title: str, url: str, text: str) -> dict:
+        """Call the OpenAI Chat Completions API and parse a best-effort JSON dict result."""
         api_key = self._openai_api_key()
         if not api_key:
             return {}
 
-        if not hasattr(self, "_analysis_cache") or getattr(self, "_analysis_cache") is None:
-            self._analysis_cache = {}
         if not hasattr(self, "_last_logged_openai_model"):
             self._last_logged_openai_model = None
-
-        cached = self._analysis_cache.get(url)
-        if cached is not None:
-            return cached
 
         model = self._openai_model()
         if self._last_logged_openai_model != model:
@@ -212,7 +338,7 @@ class Provider(ABC):
         system = self.openai_system_prompt()
         user = self.openai_user_prompt(title=title, url=url, text=text)
 
-        openai_timeout_s = 60
+        openai_timeout_s = 120
         t0 = time.monotonic()
 
         def _log_openai_request_exception(prefix: str, exc: requests.exceptions.RequestException) -> None:
@@ -329,10 +455,10 @@ class Provider(ABC):
             "model": model,
         }
 
-        self._analysis_cache[url] = result
         return result
 
     def _html_to_text(self, html: str) -> str:
+        """Convert HTML into normalized plain text (best-effort)."""
         if not html:
             return ""
         soup = BeautifulSoup(html, "html.parser")

@@ -32,7 +32,7 @@ IMAGE_NAME=scraper TAG=latest DOCKERHUB_NAMESPACE=<dockerhub-namespace>
 
 Uses the local image (builds it if missing) and runs the container.
 
-The container stores its `state.json` in a named Docker volume (default: `scraper_state`) so it persists across redeploys.
+The container stores its `state.<provider-key>.json` in a named Docker volume (default: `scraper_state`) so it persists across redeploys.
 
 ```sh
 ./docker/deploy.sh

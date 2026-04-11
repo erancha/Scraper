@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-STATE_FILE = Path(os.getenv("STATE_FILE", str(Path(__file__).parent / "state.json")))
+STATE_FILE = Path(os.getenv("STATE_FILE") or "state.json")
 EMAIL_TO: list[str] = []
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -57,12 +57,22 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # seconds between chec
 DRY_RUN = False  # Set via --dry-run CLI flag; skips actual email sending
 
 
+def _get_provider(provider_key: str) -> Provider:
+    """Return the Provider instance for the given provider key."""
+    provider = PROVIDERS.get(provider_key)
+    if provider is None:
+        raise KeyError(f"Unknown provider '{provider_key}'. Available: {', '.join(PROVIDERS)}")
+    return provider
+
+
 def _provider_env_key(provider_key: str) -> str:
+    """Return an env-var-safe suffix for provider-scoped configuration."""
     # Convert provider keys like "espn-nba" into a safe env-var suffix: "ESPN_NBA".
     return re.sub(r"[^a-zA-Z0-9]+", "_", provider_key.strip()).strip("_").upper()
 
 
 def _getenv_provider_scoped(name: str, provider_key: str) -> str:
+    """Read an environment variable, optionally overridden per provider."""
     # Resolution order:
     # - <NAME>__<PROVIDER_ENV_KEY> (e.g. EMAIL_TO__ESPN_NBA)
     # - <NAME> (global default)
@@ -71,59 +81,230 @@ def _getenv_provider_scoped(name: str, provider_key: str) -> str:
 
 
 # -------------------------------------------------------------------------------------------------------------------------------
-# State helpers – Persist which events have already been reported as completed between runs, using a local JSON file (state.json).
-# This prevents duplicate emails: an event is only emailed about once, the first time it appears as completed.
-# State is keyed per source (e.g. state["espn_nba"]["completed_ids"]) so multiple sources coexist cleanly.
+# State helpers – Persist which events have already been reported as completed between runs, using a local JSON file.
+# This prevents duplicate emails: an event is only notified about once, the first time it appears as completed.
+#
+# State is stored per-provider in a dedicated file (e.g. state.ynet-sport.json). 
 # -------------------------------------------------------------------------------------------------------------------------------
 def _state_file_for_provider(provider_key: str) -> Path:
+    """Return the per-provider state file path derived from STATE_FILE."""
     suffix = re.sub(r"[^a-zA-Z0-9._-]+", "_", provider_key.strip())
     return STATE_FILE.with_name(f"{STATE_FILE.stem}.{suffix}{STATE_FILE.suffix}")
 
 
-def load_state() -> dict:
-    """Return the full persisted state dict."""
-    if STATE_FILE.exists():
-        with open(STATE_FILE, "r") as f:
+def load_state(provider_key: str) -> dict:
+    """Return the persisted state dict for a single provider."""
+    state_file = _state_file_for_provider(provider_key)
+    if state_file.exists():
+        with open(state_file, "r") as f:
             return json.load(f)
     return {}
 
 
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w") as f:
+def save_state(state: dict, provider_key: str) -> None:
+    """Persist the given provider state dict to disk."""
+    state_file = _state_file_for_provider(provider_key)
+    with open(state_file, "w") as f:
         json.dump(state, f, indent=2)
 
 
 def provider_state(state: dict, provider: Provider) -> dict:
-    """Return (or create) the sub-dict for a given provider inside the global state."""
-    key = provider.state_key
-    if key not in state:
-        # Initialize per-provider state on first run (notified/evaluated IDs + last check timestamp).
-        provider_state_data = {provider.notified_ids_state_key(): [], "last_check": None}
-        evaluated_key = provider.evaluated_ids_state_key()
-        if evaluated_key:
-            provider_state_data[evaluated_key] = []
-        state[key] = provider_state_data
-    return state[key]
+    """Return (or create) the provider's state dict for the active provider."""
+
+    # ---- Ensure required keys exist ----
+    rejected_key = provider.rejected_ids_state_key()
+    if rejected_key not in state:
+        state[rejected_key] = []
+
+    notified_key = provider.notified_ids_state_key()
+    if notified_key not in state:
+        state[notified_key] = {}
+
+    if "last_check" not in state:
+        state["last_check"] = None
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Processing
+# ---------------------------------------------------------------------------
+def _keep_unrejected_items(items: list[dict], previous_rejected_ids: set[str]) -> list[dict]:
+    """Filter out items that were previously rejected."""
+    return [
+        it
+        for it in items
+        if str(it.get("id")) not in previous_rejected_ids
+    ]
+
+
+def _keep_unnotified_items(items: list[dict], provider: Provider) -> list[dict]:
+    """Filter out items that were already notified (emailed) in previous runs."""
+    provider_state_data = provider.provider_state or {}
+    notified = provider_state_data.get(provider.notified_ids_state_key(), {})
+
+    if isinstance(notified, dict):
+        notified_ids = {str(x) for day_ids in notified.values() for x in (day_ids or [])}
+    elif isinstance(notified, list):
+        notified_ids = {str(x) for x in notified}
+    else:
+        notified_ids = set()
+
+    return [it for it in items if str(it.get("id")) not in notified_ids]
+
+
+def _published_dt_for_cutoff(item: dict) -> datetime | None:
+    """Extract a best-effort published datetime for cutoff comparisons.
+
+    Time zone semantics:
+    - If the source timestamp is tz-aware (e.g. ends with `Z`), it is normalized to **UTC** and returned as a **naive UTC** `datetime`.
+    - If the source timestamp is tz-naive, it is assumed to be in the machine's **local time zone**, then converted to **naive UTC**.
+
+    Returns None when no timestamp is present or parsing fails.
+    """
+    raw = (
+        item.get("published_at")
+        or item.get("date")
+        or item.get("published")
+        or item.get("publishedAt")
+        or ""
+    )
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    except Exception:
+        return None
+    local_tz = datetime.now().astimezone().tzinfo
+    if dt.tzinfo is None and local_tz is not None:
+        dt = dt.replace(tzinfo=local_tz)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _sort_completed_items_newest_first(current_completed_items: list[dict]) -> None:
+    """Sort completed items newest-first by their best-effort published datetime (items without a timestamp sort last)."""
+    current_completed_items.sort(key=_published_dt_for_sort, reverse=True)
+
+
+def _published_dt_for_sort(item: dict) -> datetime:
+    """Best-effort published datetime extractor for cross-provider sorting.
+
+    Supported timestamp fields (first one found wins):
+    - published_at (Ynet HTML providers)
+    - date (ESPN)
+    - published / publishedAt (common API variants)
+
+    Time zone semantics:
+    - If the parsed value is tz-aware, it is normalized to **UTC** and returned as a **naive UTC** `datetime`.
+    - If the parsed value is tz-naive, it is returned **as-is** (tz-naive). This preserves the source representation,
+      which may be local time depending on the provider.
+
+    Items without a usable timestamp are sorted last (`datetime.min`).
+    """
+    raw = (
+        item.get("published_at")
+        or item.get("date")
+        or item.get("published")
+        or item.get("publishedAt")
+        or ""
+    )
+    if not raw:
+        return datetime.min
+    try:
+        dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    except Exception:
+        return datetime.min
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _keep_only_completed_items(provider: Provider, items: list[dict]) -> list[dict]:
+    """Filter items down to only those considered completed by the provider."""
+    current_completed_ids = provider.get_only_completed_ids(items)
+    return [item for item in items if item.get("id") in current_completed_ids]
+
+
+def _keep_completed_items_published_after_last_check(provider: Provider, current_completed_items: list[dict]) -> list[dict]:
+    """Keep completed items published after the provider's `cutoff_dt()`.
+
+    Time zone semantics:
+    - `_published_dt_for_cutoff()` returns **naive UTC**.
+    - `provider.cutoff_dt()` is provider-defined; by convention in this codebase it is typically **naive UTC** when
+      derived from `last_check`, but may be tz-naive local time when derived from a rolling `days_back` window.
+
+    This function compares the two naive datetimes exactly as provided.
+    """
+
+    cutoff_dt = provider.cutoff_dt()
+    if cutoff_dt is None:
+        return current_completed_items
+
+    logger.debug(
+        "[%s] Completed candidates: %d (before cutoff filtering: cutoff_dt=%s (naive UTC))",
+        provider.name,
+        len(current_completed_items),
+        cutoff_dt.isoformat(timespec="seconds"),
+    )
+
+    filtered: list[dict] = []
+    for it in current_completed_items:
+        published_dt = _published_dt_for_cutoff(it)
+        if published_dt is None:
+            logger.debug(
+                "[%s] Notify candidate (no timestamp): id=%s",
+                provider.name,
+                str(it.get("id")),
+            )
+            filtered.append(it)
+            continue
+
+        if published_dt > cutoff_dt:
+            logger.debug(
+                "[%s] Notify candidate (newer than cutoff_dt): id=%s published_dt=%s cutoff_dt=%s",
+                provider.name,
+                str(it.get("id")),
+                published_dt.isoformat(timespec="seconds"),
+                cutoff_dt.isoformat(timespec="seconds"),
+            )
+            filtered.append(it)
+        else:
+            logger.debug(
+                "[%s] Skip notify (not newer than cutoff_dt): id=%s published_dt=%s cutoff_dt=%s",
+                provider.name,
+                str(it.get("id")),
+                published_dt.isoformat(timespec="seconds"),
+                cutoff_dt.isoformat(timespec="seconds"),
+            )
+
+    logger.debug(
+        "[%s] Newly-notifiable completed items: %d",
+        provider.name,
+        len(filtered),
+    )
+    return filtered
 
 
 # ---------------------------------------------------------------------------
 # Email
 # ---------------------------------------------------------------------------
-def send_email(subject: str, html_body: str, plain_body: str) -> None:
+def send_email(subject: str, html_body: str, plain_body: str) -> bool:
     """Send an email via SMTP (TLS). Skipped when DRY_RUN is True."""
     if DRY_RUN:
         logger.info("[DRY-RUN] Email would be sent \u2013 skipping actual send.\nSubject: %s\n%s", subject, plain_body)
-        return
+        return True
 
     if not EMAIL_TO:
         logger.warning("EMAIL_TO not configured \u2013 skipping email.")
         logger.info("Set EMAIL_TO in .env to enable email.")
-        return
+        return False
 
     if not SMTP_USER or not SMTP_PASS:
         logger.warning("SMTP credentials not configured \u2013 skipping email.")
         logger.info("Set SMTP_USER and SMTP_PASS in .env to enable email.")
-        return
+        return False
 
     msg = MIMEMultipart("alternative")  # plain text + HTML; email client picks the best it can render
     msg.attach(MIMEText(plain_body, "plain"))
@@ -137,53 +318,62 @@ def send_email(subject: str, html_body: str, plain_body: str) -> None:
         server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(SMTP_USER, EMAIL_TO, msg.as_string())
     logger.info("Email sent to %s", ", ".join(EMAIL_TO))
+    return True
 
 
 # ---------------------------------------------------------------------------
 # Agent loop – Generic: works with any Provider implementation.
 # ---------------------------------------------------------------------------
-def check_once(provider: Provider) -> None:
+def check_once(provider_key: str) -> None:
     """Run a single scrape-check-email cycle for the given provider."""
-    state = load_state()
+    provider = _get_provider(provider_key)
+    state = load_state(provider_key)
     provider_state_data = provider_state(state, provider)
-    notified_key = provider.notified_ids_state_key()
-    known_notified_ids: set[str] = set(provider_state_data.get(notified_key, []))
+    provider.attach_state(provider_state_data)
+
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.hour == 23:
+        provider.prune_notified_ids_two_days_ago(now_utc)
+
+    rejected_key = provider.rejected_ids_state_key()
+    previous_rejected_ids: set[str] = {x for x in provider_state_data.get(rejected_key, [])}
+
+    logger.debug(
+        "[%s] State: last_check(raw)=%r last_check_dt(parsed)=%s rejected_ids=%d",
+        provider.name,
+        provider_state_data.get("last_check"),
+        provider.last_check_dt.isoformat(timespec="seconds") if provider.last_check_dt else None,
+        len(previous_rejected_ids),
+    )
 
     data = provider.fetch()
     items = provider.parse(data)
+    logger.debug("[%s] Parsed %d item(s)", provider.name, len(items))
 
-    evaluated_key = provider.evaluated_ids_state_key()
-    if evaluated_key:
-        known_evaluated_ids: set[str] = set(provider_state_data.get(evaluated_key, []))
-        current_ids = {str(i.get("id")) for i in items if i.get("id")} # a set of the IDs currently present in this scrape, normalized to strings
-        unevaluated_ids = current_ids - known_evaluated_ids # IDs that are present now but were not previously recorded as evaluated
-        items, evaluated_ids_to_add = provider.process_unevaluated_items(items, unevaluated_ids)
-        provider_state_data[evaluated_key] = list(known_evaluated_ids | evaluated_ids_to_add)
-        save_state(state)
+    items = _keep_unrejected_items(items, previous_rejected_ids)
+    items = _keep_unnotified_items(items, provider)
+    items, rejected_ids_to_save = provider.reject_items(items)
+    if rejected_ids_to_save:
+        provider_state_data[rejected_key] = list(previous_rejected_ids | rejected_ids_to_save)
+        previous_rejected_ids = set(provider_state_data.get(rejected_key, []))
+        save_state(state, provider_key)
 
-    current_completed_ids = provider.get_completed_ids(items)
-    current_completed_items = [item for item in items if str(item.get("id")) in current_completed_ids]
-
-    first_run = provider_state_data.get("last_check") is None
-    if first_run:
-        provider_state_data["last_check"] = datetime.now(timezone.utc).isoformat()
-        save_state(state)
+    current_completed_items = _keep_only_completed_items(provider, items)
+    current_completed_items = _keep_completed_items_published_after_last_check(provider, current_completed_items)
+    _sort_completed_items_newest_first(current_completed_items)
+    current_completed_items = provider.enrich_completed_items(current_completed_items)
 
     if not current_completed_items:
+        provider_state_data["last_check"] = datetime.now(timezone.utc).isoformat()
+        save_state(state, provider_key)
+        logger.debug("No newly-notifiable current_completed_items. Returning.")
         return
 
-    # ---- Completion evaluation ----
-    # Compare the set of completed IDs from this fetch against the IDs stored in state.json.
-    # An email should be sent ONLY when at least one new ID appears in the completed set that wasn't there before.
-    newly_ids_to_be_notified = current_completed_ids - known_notified_ids
-
-    if not newly_ids_to_be_notified:
-        return
-
-    logger.info("[%s] %d item(s) newly notified \u2013 sending email \u2026", provider.name, len(newly_ids_to_be_notified))
+    logger.info("[%s] %d item(s) newly notifiable \u2013 sending email \u2026", provider.name, len(current_completed_items))
 
     day_label = provider.get_day_label(data)
     
+    first_run = provider.last_check_dt is None
     if not first_run:
         logger.info("%s", provider.items_to_plain_table(current_completed_items, provider.heading(day_label)))
 
@@ -194,21 +384,22 @@ def check_once(provider: Provider) -> None:
         + "<br><p style='color:gray;font-size:12px;'>Sent by Scraper Agent</p>"
     )
     plain_body = provider.items_to_plain_table(current_completed_items, provider.heading(day_label))
-    send_email(subject, html_body, plain_body)
+    did_send = send_email(subject, html_body, plain_body)
+    if did_send:
+        provider.record_notified_ids(current_completed_items, datetime.now(timezone.utc).date().isoformat())
 
-    # Update state only when new completions are found
-    provider_state_data[notified_key] = list(known_notified_ids | current_completed_ids)
     provider_state_data["last_check"] = datetime.now(timezone.utc).isoformat()
-    save_state(state)
+    save_state(state, provider_key)
 
 
-def run_loop(provider: Provider) -> None:
+def run_loop(provider_key: str) -> None:
     """Continuously poll the given provider at CHECK_INTERVAL seconds."""
+    provider = _get_provider(provider_key)
     logger.info("Scraper Agent started (provider=%s, interval=%ds, recipient=%s)",
                 provider.name, CHECK_INTERVAL, EMAIL_TO)
     while True:
         try:
-            check_once(provider)
+            check_once(provider_key)
         except requests.RequestException as exc:
             logger.error("[%s] Network error: %s", provider.name, exc)
         except Exception as exc:
@@ -220,15 +411,17 @@ def run_loop(provider: Provider) -> None:
 
 
 def _spawn_provider_process(provider_key: str, mode: str) -> subprocess.Popen:
+    """Spawn a new scraper subprocess for a single provider."""
     script_path = str(Path(__file__).resolve())
     cmd = [sys.executable, script_path, mode, "--provider", provider_key]
 
     env = os.environ.copy()
-    env["STATE_FILE"] = os.environ.get("STATE_FILE") or str(Path(__file__).parent / "state.json")
+    env["STATE_FILE"] = env.get("STATE_FILE") or str(STATE_FILE)
     return subprocess.Popen(cmd, env=env)
 
 
 def run_all_isolated(mode: str) -> int:
+    """Run each provider in a dedicated subprocess and return an exit code."""
     provider_keys = list(PROVIDERS.keys())
     logger.info("Starting %d isolated provider process(es): %s", len(provider_keys), ", ".join(provider_keys))
 
@@ -311,11 +504,7 @@ if __name__ == "__main__":
         if addr.strip()
     ]
 
-    # Make per-provider state files the default even when running a single provider.
-    STATE_FILE = _state_file_for_provider(provider_key)
-    active_provider = PROVIDERS[provider_key]
-
     if mode == "once":
-        check_once(active_provider)
+        check_once(provider_key)
     else:
-        run_loop(active_provider)
+        run_loop(provider_key)

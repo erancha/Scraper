@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 *.pyo
 venv/
-state.json
+state.*.json
 .git/
 .gitignore
 README.md

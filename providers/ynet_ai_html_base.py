@@ -1,9 +1,18 @@
+"""HTML-based Ynet providers with optional OpenAI classification/summarization.
+ 
+ This module defines a base Provider implementation that:
+ - fetches a Ynet listing page (HTML)
+ - extracts candidate article links
+ - fetches relevant articles and uses OpenAI to summarize/classify
+ - returns a list of item dicts suitable for the generic agent loop
+ """
+ 
 from __future__ import annotations
 
 import logging
 import re
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -16,42 +25,62 @@ logger = logging.getLogger(__name__)
 
 
 class YnetAiHtmlProviderBase(Provider, ABC):
+    """Base class for Ynet HTML listing providers.
+ 
+    Subclasses configure:
+    - `url`: listing page URL
+    - `allowed_path_prefixes`: which link paths from the listing page are candidates
+ 
+    The base class implements scraping, best-effort publish-time extraction, 
+    and an optional OpenAI step that can both summarize and classify content.
+    """
+ 
     def __init__(self) -> None:
-        self._analysis_cache: dict[str, dict] = {}
+        """Initialize internal bookkeeping used for OpenAI model logging."""
         self._last_logged_openai_model: str | None = None
 
     @property
     @abstractmethod
     def allowed_path_prefixes(self) -> tuple[str, ...]:
+        """Allowed URL path prefixes for article links found on the listing page."""
         ...
 
     @property
     def max_listing_items(self) -> int:
+        """Maximum number of candidate links to keep from the listing page."""
         return 40
 
     @property
     def max_unevaluated_to_process(self) -> int:
+        """Maximum number of candidate items to fetch/classify per run."""
         return 25
 
     @property
     def max_kept_items(self) -> int:
+        """Maximum number of non-rejected items to keep after evaluation."""
         return 40
 
     @property
     def min_title_len(self) -> int:
+        """Minimum extracted link text length to consider it a valid candidate."""
         return 10
 
     @property
     def days_back(self) -> int:
+        """Default rolling lookback window when `last_check` is not available."""
         return 1
 
     def is_rtl(self) -> bool:
+        """Ynet content is Hebrew; render human-facing output as RTL by default."""
         return True
 
-    def evaluated_ids_state_key(self) -> str | None:
-        return "evaluated_ids"
-
     def fetch(self) -> dict:
+        """Fetch the listing page HTML.
+ 
+        Returns a dict containing:
+        - `html`: raw HTML
+        - `fetched_at`: ISO timestamp (UTC)
+        """
         resp = requests.get(
             self.url,
             timeout=30,
@@ -67,6 +96,13 @@ class YnetAiHtmlProviderBase(Provider, ABC):
         return {"html": resp.text, "fetched_at": datetime.utcnow().isoformat()}
 
     def parse(self, data: dict) -> list[dict]:
+        """Parse listing HTML into a list of candidate item dicts.
+ 
+        Each item contains:
+        - `id`: absolute URL (used for de-duplication)
+        - `title`: link text
+        - `url`: absolute URL
+        """
         html = data.get("html") or ""
         soup = BeautifulSoup(html, "html.parser")
 
@@ -74,6 +110,7 @@ class YnetAiHtmlProviderBase(Provider, ABC):
         dedup_ids: set[str] = set()
 
         def normalize_href(href: str) -> str:
+            """Convert an <a href> value to a canonical absolute URL (no fragment)."""
             abs_url = urljoin(self.url, href)
             parsed = urlparse(abs_url)
             return parsed._replace(fragment="").geturl()
@@ -107,21 +144,36 @@ class YnetAiHtmlProviderBase(Provider, ABC):
 
         return items
 
-    def process_unevaluated_items(self, items: list[dict], unevaluated_ids: set[str]) -> tuple[list[dict], set[str]]:
-        if not unevaluated_ids:
-            logger.debug("[%s] No unevaluated ids", self.name)
-            return [], set()
+    def reject_items(self, items: list[dict]) -> tuple[list[dict], set[str]]:
+        """Reject items that are too old or irrelevant; sets `published_at` (always) and `summary` (if not rejected).
 
-        unevaluated_items = [it for it in items if str(it.get("id")) in unevaluated_ids]
+        Rejections due to relevancy are persisted by the agent loop via `rejected_ids` so we don't fetch, summarize, or classify the same URL repeatedly.
 
-        kept: list[dict] = []
-        for it in unevaluated_items[: self.max_unevaluated_to_process]:
+        Time zone semantics:
+        - `effective_cutoff_dt` comes from `Provider.cutoff_dt()`.
+          - when derived from `last_check`, it is **naive UTC**.
+          - when derived from `days_back`, it is **tz-naive local time**.
+        - `published_at` is stored as a raw string extracted from the page.
+        - For cutoff comparisons in this method, `published_at` is parsed and normalized to **naive UTC**:
+          - tz-aware values are converted to UTC and made naive
+          - tz-naive values are assumed to be local time and converted to naive UTC
+        """
+        items_to_keep: list[dict] = []
+        rejected_ids_to_save: set[str] = set()
+
+        effective_cutoff_dt = self.cutoff_dt()
+        logger.debug(
+            "[%s] reject_items: effective_cutoff_dt=%s (naive UTC)",
+            self.name,
+            effective_cutoff_dt.isoformat(timespec="seconds") if effective_cutoff_dt else None,
+        )
+
+        for it in items[: self.max_unevaluated_to_process]:
             url = str(it.get("url") or "")
             title = str(it.get("title") or "")
-            if not url:
+            item_id = str(it.get("id") or url)
+            if not url or not item_id:
                 continue
-
-            cutoff_dt = datetime.now() - timedelta(days=int(self.days_back or 0))  # Keep only items newer than this rolling cutoff (resolution: days; comparison uses local time down to seconds).
 
             try:
                 logger.debug("[%s] Fetching article: %s", self.name, url)
@@ -129,19 +181,30 @@ class YnetAiHtmlProviderBase(Provider, ABC):
                 published_at = self._extract_published_at(soup)
                 if published_at:
                     it["published_at"] = published_at
-                    # Keep only items newer than cutoff_dt:
                     try:
                         dt_raw = str(published_at).strip().replace("Z", "+00:00")
                         published_dt = datetime.fromisoformat(dt_raw)
+                        local_tz = datetime.now().astimezone().tzinfo
+                        if published_dt.tzinfo is None and local_tz is not None:
+                            published_dt = published_dt.replace(tzinfo=local_tz)
                         if published_dt.tzinfo is not None:
-                            published_dt = published_dt.astimezone().replace(tzinfo=None)
-                        if published_dt < cutoff_dt:
+                            published_dt = published_dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+                        logger.debug(
+                            "[%s] Parsed published_at: url=%s raw=%r normalized_utc=%s cutoff_utc=%s",
+                            self.name,
+                            url,
+                            published_at,
+                            published_dt.isoformat(timespec="seconds"),
+                            effective_cutoff_dt.isoformat(timespec="seconds") if effective_cutoff_dt else None,
+                        )
+                        if effective_cutoff_dt is not None and published_dt < effective_cutoff_dt:
                             logger.debug(
                                 "[%s] Filtered out (too old): %s published_at=%s cutoff=%s",
                                 self.name,
                                 url,
                                 published_at,
-                                cutoff_dt.isoformat(timespec="seconds"),
+                                effective_cutoff_dt.isoformat(timespec="seconds"),
                             )
                             continue
                     except Exception:
@@ -161,36 +224,48 @@ class YnetAiHtmlProviderBase(Provider, ABC):
                         "[%s] OpenAI analysis failed: %s (%s)",
                         self.name,
                         url,
-                        exc.__class__.__name__,  # Keep the exception type in the log line for quick filtering/alerting.
-                        exc_info=True,  # Include traceback to diagnose rare network/provider failures.
+                        exc.__class__.__name__,
+                        exc_info=True,
                     )
                     analysis = {}
 
             if not self.is_relevant(title=title, url=url, text=text, analysis=analysis):
                 logger.debug("[%s] Filtered out (irrelevant): %s", self.name, url)
+                rejected_ids_to_save.add(item_id)
                 continue
 
             summary = (analysis.get("summary") or "").strip() if analysis else ""
             if summary:
                 it["summary"] = summary
 
-            kept.append(it)
+            items_to_keep.append(it)
             logger.debug("[%s] Kept: %s", self.name, url)
-            if len(kept) >= self.max_kept_items:
+            if len(items_to_keep) >= self.max_kept_items:
                 break
 
-        return kept, unevaluated_ids
+        return items_to_keep, rejected_ids_to_save
 
     def is_relevant(self, title: str, url: str, text: str, analysis: dict) -> bool:
+        """Provider-specific relevancy filter.
+ 
+        Subclasses can use `analysis` (when OpenAI is enabled) and/or fallback to a keyword-based rule.
+        """
         return True
 
     def get_day_label(self, data: dict) -> str:
+        """Return a display day label for emails/logs.
+
+        Time zone semantics:
+        - Uses `datetime.now()` which reflects the machine's **local time zone**.
+        """
         return datetime.now().strftime("%Y-%m-%d")
 
-    def get_completed_ids(self, items: list[dict]) -> set[str]:
-        return {str(i.get("id")) for i in items if i.get("id")}
+    def get_only_completed_ids(self, items: list[dict]) -> set[str]:
+        """Return the set of item IDs from the given list."""
+        return {str(i.get("id")) for i in items if i.get("id")} # IDs of all items.
 
     def item_to_text(self, item: dict) -> str:
+        """Render a single item as console-friendly text (title/url + optional summary)."""
         title = item.get("title", "")
         url = item.get("url", "")
         summary = item.get("summary", "")
@@ -205,6 +280,7 @@ class YnetAiHtmlProviderBase(Provider, ABC):
         return f"{header}\n{url}".strip()
 
     def items_to_html_table(self, items: list[dict]) -> str:
+        """Render items as a simple HTML table suitable for an email body."""
         rows = []
         for it in items:
             title = (it.get("title") or "").replace("<", "&lt;").replace(">", "&gt;")
@@ -237,25 +313,29 @@ class YnetAiHtmlProviderBase(Provider, ABC):
 
         return (
             "<table dir='rtl' border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;direction:rtl;text-align:right'>"
-            "<thead><tr><th style='text-align:right'>New articles</th></tr></thead>"
             "<tbody>"
             + "".join(rows)
             + "</tbody></table>"
         )
 
     def openai_system_prompt(self) -> str:
+        """OpenAI system prompt used when summarizing/classifying articles."""
         return "Return ONLY valid JSON with keys: summary (string)."
 
     def openai_user_prompt_prefix(self) -> str:
+        """Optional extra instruction prepended to the user prompt."""
         return ""
 
     def openai_summary_instruction(self) -> str:
+        """Instruction describing the desired summary style/language."""
         return "Write a concise 8-12 sentence summary in Hebrew."
 
     def openai_article_text_label(self) -> str:
+        """Label used for the article text section inside the user prompt."""
         return "Text"
 
     def openai_user_prompt(self, title: str, url: str, text: str) -> str:
+        """Build the OpenAI user prompt for a given article."""
         prefix = (self.openai_user_prompt_prefix() or "").strip()
         if prefix:
             prefix = prefix + "\n\n"
@@ -271,6 +351,7 @@ class YnetAiHtmlProviderBase(Provider, ABC):
         )
 
     def _fetch_article_soup(self, url: str) -> BeautifulSoup:
+        """Fetch an article URL and return a BeautifulSoup document."""
         resp = requests.get(
             url,
             timeout=30,
@@ -286,9 +367,11 @@ class YnetAiHtmlProviderBase(Provider, ABC):
         return BeautifulSoup(resp.text, "html.parser")
 
     def _extract_article_text(self, soup: BeautifulSoup) -> str:
+        """Extract article text (best-effort) from a parsed HTML soup."""
         return self._html_to_text(str(soup))
 
     def _extract_published_at(self, soup: BeautifulSoup) -> str:
+        """Extract a best-effort publish/modified timestamp string from an article page."""
         for script in soup.find_all("script"):
             txt = script.string or script.get_text(" ", strip=True)
             if not txt:
@@ -353,6 +436,12 @@ class YnetAiHtmlProviderBase(Provider, ABC):
         return ""
 
     def _format_published_at(self, published_at: str) -> str:
+        """Format a raw timestamp string into a compact display string.
+
+        Time zone semantics:
+        - If `published_at` parses as tz-aware, it is converted to the machine's **local time zone** for display.
+        - If it parses as tz-naive, it is treated as tz-naive and formatted **as-is** (no implicit UTC/local conversion).
+        """
         if not published_at:
             return ""
 

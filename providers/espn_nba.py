@@ -5,36 +5,54 @@ All logic specific to https://www.espn.com/nba/scoreboard lives here:
 URL, JSON parsing, game-completion detection, and text/HTML formatting.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import os
+
+import logging
 
 import requests
 
 from .base import Provider
 
 
+logger = logging.getLogger(__name__)
+
+
 class EspnNba(Provider):
     """Scrapes the ESPN NBA scoreboard via their public JSON API."""
 
     def __init__(self) -> None:
-        self._analysis_cache: dict[str, dict] = {}
+        """Initialize provider instance state used for OpenAI model logging."""
         self._last_logged_openai_model: str | None = None
+
+    def cutoff_dt(self) -> datetime | None:
+        """Disable time-based filtering.
+
+        ESPN's scoreboard API response is already scoped to the current day, 
+        so there is no need for additional datetime cutoff filtering in the agent.
+        """
+        return None
 
     # -- Provider identity ---------------------------------------------------
 
     @property
     def name(self) -> str:
+        """Human-readable provider name."""
         return "ESPN NBA"
 
     @property
     def state_key(self) -> str:
+        """Unique key used to namespace this provider's data: state.<provider-key>.json."""
         return "espn_nba"
 
     @property
     def url(self) -> str:
+        """Scoreboard API URL returning games for the day."""
         return "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 
     @property
     def standings_url(self) -> str:
+        """Standings API URL used to enrich the HTML email with conference tables."""
         return "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
 
     def fetch(self) -> dict:
@@ -53,6 +71,7 @@ class EspnNba(Provider):
         return scoreboard
 
     def heading(self, day_label: str) -> str:
+        """Display heading for output/emails."""
         return f"NBA Scoreboard – {day_label}"
 
     # -- Parse ---------------------------------------------------------------
@@ -75,6 +94,17 @@ class EspnNba(Provider):
             status_type = status_obj.get("type", {})
             game["status"] = status_type.get("description", "")
             game["status_id"] = status_type.get("id", "0")  # 1=scheduled, 2=in-progress, 3=final
+            game["status_state"] = status_type.get("state", "")
+            game["status_completed"] = bool(status_type.get("completed", False))
+            logger.debug(
+                "ESPN NBA event id=%s name=%s status_id=%s state=%s completed=%s desc=%s",
+                str(game.get("id")),
+                str(game.get("name")),
+                str(game.get("status_id")),
+                str(game.get("status_state")),
+                str(game.get("status_completed")),
+                str(game.get("status")),
+            )
             game["clock"] = status_obj.get("displayClock", "")
             game["period"] = status_obj.get("period", 0)
 
@@ -155,12 +185,15 @@ class EspnNba(Provider):
         return games
 
     def openai_summary_instruction(self) -> str:
+        """Instruction describing the desired OpenAI recap summary style/language."""
         return "Write a concise 3-5 sentence recap summary in Hebrew."
 
     def _openai_max_recap_chars(self) -> int:
+        """Maximum number of recap page characters to send to OpenAI."""
         return 8000
 
     def _fetch_recap_summary(self, game: dict) -> str:
+        """Fetch the game recap HTML and summarize it via OpenAI (best-effort)."""
         recap_url = str(game.get("recapUrl") or "").strip()
         if not recap_url:
             return ""
@@ -197,35 +230,69 @@ class EspnNba(Provider):
         summary = (analysis.get("summary") or "").strip() if isinstance(analysis, dict) else ""
         return summary
 
-    def process_unevaluated_items(self, items: list[dict], unevaluated_ids: set[str]) -> tuple[list[dict], set[str]]:
-        notify_items = [it for it in items if str(it.get("id")) in unevaluated_ids]
-        for g in notify_items:
-            if str(g.get("status_id")) != "3":
+    def enrich_completed_items(self, items: list[dict]) -> list[dict]:
+        """Enrich completed games with recap summaries (best-effort).
+
+        This does not reject any items; it only adds `recapSummary` when possible.
+        """
+        for g in items:
+            # logging.debug(g)
+            is_completed = (
+                str(g.get("status_id")) == "3"
+                or bool(g.get("status_completed"))
+                or str(g.get("status_state") or "").lower() == "post"
+            )
+            if not is_completed:
                 continue
+
+            if g.get("recapSummary"):
+                continue
+
             try:
                 summary = self._fetch_recap_summary(g)
             except Exception:
                 summary = ""
             if summary:
                 g["recapSummary"] = summary
-        return notify_items, set(unevaluated_ids)
-
-    # -- Completion detection ------------------------------------------------
+        return items
 
     def get_day_label(self, data: dict) -> str:
+        """Extract the day label from the ESPN scoreboard payload.
+
+        Time zone semantics:
+        - This value is taken verbatim from ESPN (`data['day']['date']`). It is a date string without an explicit time zone.
+        - It should be treated as a display label only (not used for datetime arithmetic).
+        """
         return data.get("day", {}).get("date", "today")
 
-    def evaluated_ids_state_key(self) -> str | None:
-        return "evaluated_ids"
-
-    def get_completed_ids(self, items: list[dict]) -> set[str]:
-        """status_id '3' means Final in ESPN's API."""
-        return {g["id"] for g in items if str(g.get("status_id")) == "3"}
+    # -- Completion detection ------------------------------------------------
+    def get_only_completed_ids(self, items: list[dict]) -> set[str]:
+        """Return the set of IDs for items that are completed (final) within the given list."""
+        # return {g["id"] for g in items if str(g.get("status_id")) == "3"} # status_id '3' means Final in ESPN's API
+        completed = set()
+        for g in items:
+            status_id = str(g.get("status_id"))
+            if status_id == "3":
+                completed.add(g["id"])
+                continue
+            if bool(g.get("status_completed")):
+                completed.add(g["id"])
+                continue
+            if str(g.get("status_state") or "").lower() == "post":
+                completed.add(g["id"])
+                continue
+        return completed
 
     # -- Formatting ----------------------------------------------------------
 
     def item_to_text(self, g: dict) -> str:
-        """Render a single game as console-friendly plain text."""
+        """Render a single game as console-friendly plain text.
+
+        Time zone semantics:
+        - ESPN's `g['date']` is typically an ISO-8601 timestamp with a time zone (often `Z`).
+        - When tz-aware, this method converts it to the machine's **local time zone** for display.
+        - When tz-naive or unparsable, the raw string is displayed as-is.
+        """
         lines: list[str] = []
 
         dt = g.get("date", "")
@@ -242,13 +309,19 @@ class EspnNba(Provider):
         home = next((t for t in g["teams"] if t["homeAway"] == "home"), None)
 
         def team_line(t: dict, label: str) -> str:
+            """Render a single team's line (name/score/records) for plain-text output."""
             score_part = f"  {t['score']}" if t.get("score") else ""
             rec_part = f"  ({t['record']}  {t['homeAwayRecord']} {label})" if t.get("record") else ""
             return f"  {t['name']}{score_part}{rec_part}"
 
-        status_line = g["status"]
-        if g.get("broadcast"):
-            status_line += f"  [{g['broadcast']}]"
+        def get_status_line(g: dict) -> str:
+            """Return the game status line (status + broadcast)."""
+            status_line = g["status"]
+            if g.get("broadcast"):
+                status_line += f"  [{g['broadcast']}]"
+            return status_line
+
+        status_line = get_status_line(g)
 
         lines.append(f"{dt_display}   {status_line}")
         if away:
@@ -290,7 +363,12 @@ class EspnNba(Provider):
         return "\n".join(lines)
 
     def items_to_html_table(self, items: list[dict]) -> str:
-        """Build an HTML table summarising all games (used in the email body)."""
+        """Build an HTML table summarising all games (used in the email body).
+
+        Time zone semantics:
+        - Uses `g['date']` and, when tz-aware, converts it to the machine's **local time zone** for display in the email.
+        - When tz-naive or unparsable, falls back to displaying the raw value.
+        """
         rows = []
         for g in items:
             away = next((t for t in g["teams"] if t["homeAway"] == "away"), None)
@@ -309,8 +387,8 @@ class EspnNba(Provider):
             recap_url = g.get("recapUrl") or ""
             recap_summary = (g.get("recapSummary") or "").replace("<", "&lt;").replace(">", "&gt;")
 
-            # Build per-team leader summaries for the email (single-line each team)
             def leaders_inline(team: dict) -> str:
+                """Render a team's leader stats as a single-line string for the email."""
                 parts = []
                 for ldr in team.get("leaders", []):
                     parts.append(
@@ -371,6 +449,7 @@ class EspnNba(Provider):
         return games_table + standings_section
 
     def _parse_standings(self, data: dict) -> dict:
+        """Parse ESPN standings payload into a conference/rows structure for rendering."""
         conferences = []
         for child in data.get("children", []):
             if not child.get("isConference"):
@@ -462,6 +541,7 @@ class EspnNba(Provider):
         return {"seasonDisplayName": season_display_name, "conferences": conferences}
 
     def _standings_to_html_table(self, conf: dict) -> str:
+        """Render a single conference standings table as HTML."""
         rows = []
         for r in conf.get("rows", []):
             seed = r.get("seed", "")
