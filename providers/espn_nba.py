@@ -96,6 +96,7 @@ class EspnNba(Provider):
             game["status_id"] = status_type.get("id", "0")  # 1=scheduled, 2=in-progress, 3=final
             game["status_state"] = status_type.get("state", "")
             game["status_completed"] = bool(status_type.get("completed", False))
+            game["status_last_updated"] = status_obj.get("lastUpdated", "")
             logger.debug(
                 "ESPN NBA event id=%s name=%s status_id=%s state=%s completed=%s desc=%s",
                 str(game.get("id")),
@@ -183,6 +184,46 @@ class EspnNba(Provider):
 
             games.append(game)
         return games
+
+    def should_record_notifiable_id(self, item: dict, day_key: str) -> bool:
+        """Skip recording `notified_ids` for recently-completed games with no recap yet.
+
+        Motivation: ESPN sometimes publishes the recap page with a delay. 
+        If we email a game immediately after it goes Final but we couldn't retrieve a recap summary yet, 
+        we want to allow the next run(s) to re-notify once the recap becomes available.
+
+        Heuristic:
+        - This method is called from `Provider.record_notifiable_ids()`, which in this codebase is invoked on the agent's `current_completed_items` (so completion filtering happens upstream).
+        - If `recapSummary` is still missing/blank AND the game's `status_last_updated` timestamp is within the last hour (UTC), do not persist the ID.
+        - If `status_last_updated` is missing/unparseable, fall back to persisting the ID.
+        """
+        recap_summary = (item.get("recapSummary") or "").strip()
+        if recap_summary:
+            return True
+
+        raw_last_updated = str(item.get("status_last_updated") or "").strip()
+        if not raw_last_updated:
+            return True
+
+        try:
+            last_updated = datetime.fromisoformat(raw_last_updated.replace("Z", "+00:00"))
+        except Exception:
+            return True
+
+        # Normalize ESPN's `lastUpdated` into a tz-aware UTC datetime so arithmetic with
+        # `now_utc = datetime.now(timezone.utc)` is well-defined.
+        # - If the parsed timestamp is tz-naive, assume it is already UTC.
+        # - If it is tz-aware, convert it to UTC.
+        if last_updated.tzinfo is None:
+            last_updated = last_updated.replace(tzinfo=timezone.utc)
+        else:
+            last_updated = last_updated.astimezone(timezone.utc)
+
+        now_utc = datetime.now(timezone.utc)
+        if now_utc - last_updated < timedelta(hours=1):
+            return False
+
+        return True
 
     def openai_summary_instruction(self) -> str:
         """Instruction describing the desired OpenAI recap summary style/language."""

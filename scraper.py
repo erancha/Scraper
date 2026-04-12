@@ -386,7 +386,7 @@ def check_once(provider_key: str) -> None:
     plain_body = provider.items_to_plain_table(current_completed_items, provider.heading(day_label))
     did_send = send_email(subject, html_body, plain_body)
     if did_send:
-        provider.record_notified_ids(current_completed_items, datetime.now(timezone.utc).date().isoformat())
+        provider.record_notifiable_ids(current_completed_items, datetime.now(timezone.utc).date().isoformat())
 
     provider_state_data["last_check"] = datetime.now(timezone.utc).isoformat()
     save_state(state, provider_key)

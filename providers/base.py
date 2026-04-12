@@ -120,8 +120,19 @@ class Provider(ABC):
         """
         return "notified_ids"
 
-    def record_notified_ids(self, newly_notified_items: list[dict], day_key: str) -> None:
-        """Persist newly_notified_items IDs under `notified_ids`, grouped by `day_key`.
+    def should_record_notifiable_id(self, item: dict, day_key: str) -> bool:
+        """Return whether the given item's ID should be persisted under `notified_ids`.
+
+        This hook exists so providers can decide to *send* an item but avoid marking it as
+        notified for retry semantics (e.g. an enrichment step like a recap/article isn't available yet, 
+        so the provider wants the agent to email again later).
+
+        Default: True.
+        """
+        return True
+
+    def record_notifiable_ids(self, newly_notifiable_items: list[dict], day_key: str) -> None:
+        """Persist newly_notifiable_items IDs under `notified_ids`, grouped by `day_key`.
 
         The agent loop is responsible for calling this *after* an email is sent, and then saving state to disk.
         """
@@ -134,7 +145,9 @@ class Provider(ABC):
 
         notified_ids_for_day = notified_ids_by_days.get(day_key) or []
         notified_ids_for_day_set = {x for x in notified_ids_for_day} # Creates a set and implicitly dedupes
-        for it in newly_notified_items:
+        for it in newly_notifiable_items:
+            if not self.should_record_notifiable_id(it, day_key):
+                continue
             it_id = it.get("id")
             notified_ids_for_day_set.add(str(it_id))
 
@@ -247,11 +260,16 @@ class Provider(ABC):
     def _openai_api_key(self) -> str:
         return (os.getenv("OPENAI_API_KEY") or "").strip()
 
-    def _openai_model(self) -> str:
-        raw = (os.getenv("OPENAI_MODEL") or "").strip()
+    def _openai_model(self, is_primary: bool) -> str:
+        env_var = "OPENAI_MODEL" if is_primary else "OPENAI_FALLBACK_MODEL"
+        default_model = "gpt-4o-mini" if is_primary else None
+        raw = (os.getenv(env_var) or "").strip()
+        raw = raw.split("#", 1)[0].strip() if raw else ""
         if raw:
-            raw = raw.split("#", 1)[0].strip()
-        return raw or "gpt-4o-mini"
+            return raw
+        if default_model is not None:
+            return default_model
+        return ""
 
     def _estimate_openai_cost_usd(self, model: str, prompt_tokens: int, completion_tokens: int) -> float:
         """Estimate OpenAI request cost in USD based on token usage and configured pricing overrides."""
@@ -330,18 +348,23 @@ class Provider(ABC):
         if not hasattr(self, "_last_logged_openai_model"):
             self._last_logged_openai_model = None
 
-        model = self._openai_model()
+        model = self._openai_model(is_primary=True)
         if self._last_logged_openai_model != model:
             logger.info("[%s] OpenAI model=%s", self.name, model)
             self._last_logged_openai_model = model
+        fallback_model = self._openai_model(is_primary=False)
 
-        system = self.openai_system_prompt()
-        user = self.openai_user_prompt(title=title, url=url, text=text)
+        system_prompt = self.openai_system_prompt()
+        user_prompt = self.openai_user_prompt(title=title, url=url, text=text)
 
         openai_timeout_s = 120
-        t0 = time.monotonic()
 
-        def _log_openai_request_exception(prefix: str, exc: requests.exceptions.RequestException) -> None:
+        def _log_openai_request_exception(
+            prefix: str,
+            exc: requests.exceptions.RequestException,
+            model_used: str,
+            t0: float,
+        ) -> None:
             elapsed_s = time.monotonic() - t0
             logger.warning(
                 "[%s] OpenAI %s after %0.3fs url=%s model=%s (%s)",
@@ -349,50 +372,60 @@ class Provider(ABC):
                 prefix,
                 elapsed_s,
                 url,
-                model,
+                model_used,
                 exc.__class__.__name__,
                 exc_info=True,
             )
 
-        try:
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                timeout=openai_timeout_s,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "temperature": 0,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "response_format": {"type": "json_object"},
-                },
-            )
-        except requests.exceptions.Timeout as exc:
-            elapsed_s = time.monotonic() - t0
-            logger.warning(
-                "[%s] OpenAI request timed out after %0.3fs (timeout=%ss) url=%s model=%s system_len=%d user_len=%d text_len=%d",
-                self.name,
-                elapsed_s,
-                openai_timeout_s,
-                url,
-                model,
-                len(system or ""),
-                len(user or ""),
-                len(text or ""),
-                exc_info=True,
-            )
-            raise
-        except requests.exceptions.ConnectionError as exc:
-            _log_openai_request_exception("connection error", exc)
-            raise
-        except requests.exceptions.RequestException as exc:
-            _log_openai_request_exception("request error", exc)
-            raise
+        resp = None
+        models_to_try = [model]
+        if fallback_model and fallback_model != model:
+            models_to_try.append(fallback_model)
+
+        for attempt_idx, model_used in enumerate(models_to_try):
+            t0 = time.monotonic()
+            try:
+                resp = requests.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    timeout=openai_timeout_s,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model_used,
+                        "temperature": 0,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+                model = model_used
+                break
+            except requests.exceptions.Timeout as exc:
+                elapsed_s = time.monotonic() - t0
+                logger.warning(
+                    "[%s] OpenAI request timed out after %0.3fs (timeout=%ss) url=%s model=%s system_len=%d user_len=%d text_len=%d",
+                    self.name,
+                    elapsed_s,
+                    openai_timeout_s,
+                    url,
+                    model_used,
+                    len(system_prompt or ""),
+                    len(user_prompt or ""),
+                    len(text or ""),
+                    exc_info=False,
+                )
+                if attempt_idx >= (len(models_to_try) - 1):
+                    raise
+            except requests.exceptions.ConnectionError as exc:
+                _log_openai_request_exception("connection error", exc, model_used=model_used, t0=t0)
+                raise
+            except requests.exceptions.RequestException as exc:
+                _log_openai_request_exception("request error", exc, model_used=model_used, t0=t0)
+                raise
 
         elapsed_s = time.monotonic() - t0
         if not resp.ok:
