@@ -155,9 +155,9 @@ class Provider(ABC):
         state[notified_key] = notified_ids_by_days
 
     def prune_notified_ids_two_days_ago(self, today_utc: datetime) -> None:
-        """Delete the `notified_ids` bucket for two days ago (UTC).
+        """Delete the `notified_ids` buckets for two through seven days ago (UTC).
 
-        Example: if today is 2026-04-10, remove the key "2026-04-08".
+        Example: if today is 2026-04-10, remove keys "2026-04-08" through "2026-04-03".
         Intended to be called once a day (e.g. around end-of-day) to keep state bounded.
 
         No-op when provider state is missing or `notified_ids` is not a day-grouped dict.
@@ -169,12 +169,25 @@ class Provider(ABC):
         state = self.provider_state
         notified_ids_by_days = state.get(self.notified_ids_state_key())
 
-        cutoff_day_key = (today_utc.date() - timedelta(days=2)).isoformat()
-        if cutoff_day_key in notified_ids_by_days:
-            del notified_ids_by_days[cutoff_day_key]
-            logger.debug("[%s] prune_notified_ids_two_days_ago: removed day_key=%s", self.name, cutoff_day_key)
-        else:
-            logger.debug("[%s] prune_notified_ids_two_days_ago: nothing to remove (missing day_key=%s)", self.name, cutoff_day_key)
+        def prune_notified_ids_days_ago_range(from_days_ago: int = 2, to_days_ago: int = 7) -> None:
+            start = int(from_days_ago)
+            end = int(to_days_ago)
+            lo = min(start, end)
+            hi = max(start, end)
+
+            for days_ago in range(lo, hi + 1):
+                cutoff_day_key = (today_utc.date() - timedelta(days=days_ago)).isoformat()
+                if cutoff_day_key in notified_ids_by_days:
+                    del notified_ids_by_days[cutoff_day_key]
+                    logger.debug("[%s] prune_notified_ids_two_days_ago: removed day_key=%s", self.name, cutoff_day_key)
+                else:
+                    logger.debug(
+                        "[%s] prune_notified_ids_two_days_ago: nothing to remove (missing day_key=%s)",
+                        self.name,
+                        cutoff_day_key,
+                    )
+
+        prune_notified_ids_days_ago_range(from_days_ago=2, to_days_ago=7)
 
     @property
     def last_check_dt(self) -> datetime | None:
@@ -355,7 +368,7 @@ class Provider(ABC):
         fallback_model = self._openai_model(is_primary=False)
 
         system_prompt = self.openai_system_prompt()
-        user_prompt = self.openai_user_prompt(title=title, url=url, text=text)
+        original_text = text or ""
 
         openai_timeout_s = 120
 
@@ -382,52 +395,86 @@ class Provider(ABC):
         if fallback_model and fallback_model != model:
             models_to_try.append(fallback_model)
 
+        last_t0 = None
         for attempt_idx, model_used in enumerate(models_to_try):
-            t0 = time.monotonic()
-            try:
-                resp = requests.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    timeout=openai_timeout_s,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model_used,
-                        "temperature": 0,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        "response_format": {"type": "json_object"},
-                    },
-                )
-                model = model_used
-                break
-            except requests.exceptions.Timeout as exc:
-                elapsed_s = time.monotonic() - t0
-                logger.warning(
-                    "[%s] OpenAI request timed out after %0.3fs (timeout=%ss) url=%s model=%s system_len=%d user_len=%d text_len=%d",
-                    self.name,
-                    elapsed_s,
-                    openai_timeout_s,
-                    url,
-                    model_used,
-                    len(system_prompt or ""),
-                    len(user_prompt or ""),
-                    len(text or ""),
-                    exc_info=False,
-                )
-                if attempt_idx >= (len(models_to_try) - 1):
-                    raise
-            except requests.exceptions.ConnectionError as exc:
-                _log_openai_request_exception("connection error", exc, model_used=model_used, t0=t0)
-                raise
-            except requests.exceptions.RequestException as exc:
-                _log_openai_request_exception("request error", exc, model_used=model_used, t0=t0)
-                raise
+            for retry_idx in range(3):
+                factor = 0.8**retry_idx
+                sent_pct = int(round(factor * 100))
+                if original_text:
+                    new_len = max(1, int(len(original_text) * factor))
+                    text_to_send = original_text[:new_len]
+                else:
+                    text_to_send = ""
 
-        elapsed_s = time.monotonic() - t0
+                user_prompt = self.openai_user_prompt(title=title, url=url, text=text_to_send)
+
+                t0 = time.monotonic()
+                last_t0 = t0
+                try:
+                    resp = requests.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        timeout=openai_timeout_s,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": model_used,
+                            "temperature": 0,
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            "response_format": {"type": "json_object"},
+                        },
+                    )
+                    model = model_used
+                    if retry_idx > 0:
+                        logger.info(
+                            "[%s] OpenAI request succeeded after retry=%d/2 url=%s model=%s sent_pct=%d orig_text_len=%d sent_text_len=%d",
+                            self.name,
+                            retry_idx,
+                            url,
+                            model_used,
+                            sent_pct,
+                            len(original_text or ""),
+                            len(text_to_send or ""),
+                        )
+                    break
+                except requests.exceptions.Timeout as exc:
+                    elapsed_s = time.monotonic() - t0
+                    logger.warning(
+                        "[%s] OpenAI request timed out after %0.3fs (timeout=%ss) url=%s model=%s retry=%d/2 sent_pct=%d orig_text_len=%d sent_text_len=%d system_len=%d user_len=%d",
+                        self.name,
+                        elapsed_s,
+                        openai_timeout_s,
+                        url,
+                        model_used,
+                        retry_idx,
+                        sent_pct,
+                        len(original_text or ""),
+                        len(text_to_send or ""),
+                        len(system_prompt or ""),
+                        len(user_prompt or ""),
+                        exc_info=False,
+                    )
+                    if retry_idx >= 2:
+                        if attempt_idx >= (len(models_to_try) - 1):
+                            raise
+                except requests.exceptions.ConnectionError as exc:
+                    _log_openai_request_exception("connection error", exc, model_used=model_used, t0=t0)
+                    raise
+                except requests.exceptions.RequestException as exc:
+                    _log_openai_request_exception("request error", exc, model_used=model_used, t0=t0)
+                    raise
+
+            if resp is not None:
+                break
+
+        if last_t0 is None:
+            last_t0 = time.monotonic()
+
+        elapsed_s = time.monotonic() - last_t0
         if not resp.ok:
             body_preview = (resp.text or "").strip()
             if len(body_preview) > 2000:

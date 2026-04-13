@@ -25,14 +25,6 @@ class EspnNba(Provider):
         """Initialize provider instance state used for OpenAI model logging."""
         self._last_logged_openai_model: str | None = None
 
-    def cutoff_dt(self) -> datetime | None:
-        """Disable time-based filtering.
-
-        ESPN's scoreboard API response is already scoped to the current day, 
-        so there is no need for additional datetime cutoff filtering in the agent.
-        """
-        return None
-
     # -- Provider identity ---------------------------------------------------
 
     @property
@@ -54,6 +46,14 @@ class EspnNba(Provider):
     def standings_url(self) -> str:
         """Standings API URL used to enrich the HTML email with conference tables."""
         return "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
+
+    def cutoff_dt(self) -> datetime | None:
+        """Disable time-based filtering.
+
+        ESPN's scoreboard API response is already scoped to the current day, 
+        so there is no need for additional datetime cutoff filtering in the agent.
+        """
+        return None
 
     def fetch(self) -> dict:
         """Fetch scoreboard JSON and cache the standings JSON for formatting."""
@@ -239,9 +239,6 @@ class EspnNba(Provider):
         if not recap_url:
             return ""
 
-        if not self._openai_api_key():
-            return ""
-
         try:
             resp = requests.get(
                 recap_url,
@@ -262,6 +259,18 @@ class EspnNba(Provider):
         if not text:
             return ""
 
+        if len(text) < 100:
+            logger.warning(
+                "[%s] Recap text seems too short (len=%d): %s\ntext=%r",
+                self.name,
+                len(text),
+                recap_url,
+                text,
+            )
+
+        if not self._openai_api_key():
+            return ""
+
         max_chars = int(self._openai_max_recap_chars() or 0)
         if max_chars > 0 and len(text) > max_chars:
             text = text[:max_chars]
@@ -269,6 +278,21 @@ class EspnNba(Provider):
         title = str(game.get("name") or "NBA game")
         analysis = self._openai_analyze_article(title=title, url=recap_url, text=text)
         summary = (analysis.get("summary") or "").strip() if isinstance(analysis, dict) else ""
+        if summary and len(summary) < 200:
+            text_preview = (text or "").strip()
+            if len(text_preview) > 800:
+                text_preview = text_preview[:800] + "..."
+            summary_preview = summary
+            if len(summary_preview) > 800:
+                summary_preview = summary_preview[:800] + "..."
+            logger.warning(
+                "[%s] Recap summary seems too short (len=%d): %s\ntext=%r\nsummary=%r",
+                self.name,
+                len(summary),
+                recap_url,
+                text_preview,
+                summary_preview,
+            )
         return summary
 
     def enrich_completed_items(self, items: list[dict]) -> list[dict]:
