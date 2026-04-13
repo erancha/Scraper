@@ -12,6 +12,7 @@ from .base import Provider
 from .espn_nba import EspnNba
 from .ynet_sport import YnetSport
 from .ynet_news import YnetNews
+from .email_url_summary import EmailUrlSummary
 
 # -- Registry: add new providers here ---------------------------------------
 DEFAULT_PROVIDER_KEY = "espn-nba"
@@ -20,4 +21,5 @@ PROVIDERS: dict[str, Provider] = {
     DEFAULT_PROVIDER_KEY: EspnNba(),
     "ynet-sport": YnetSport(),
     "ynet-news": YnetNews(),
+    "email-url-summary": EmailUrlSummary(),
 }

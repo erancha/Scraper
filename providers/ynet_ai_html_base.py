@@ -261,8 +261,8 @@ class YnetAiHtmlProviderBase(Provider, ABC):
         return datetime.now().strftime("%Y-%m-%d")
 
     def get_only_completed_ids(self, items: list[dict]) -> set[str]:
-        """Return the set of item IDs from the given list."""
-        return {str(i.get("id")) for i in items if i.get("id")} # IDs of all items.
+        """All parsed URL items are considered immediately complete."""
+        return {str(i.get("id")) for i in items if i.get("id")}
 
     def item_to_text(self, item: dict) -> str:
         """Render a single item as console-friendly text (title/url + optional summary)."""

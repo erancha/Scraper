@@ -392,11 +392,11 @@ def check_once(provider_key: str) -> None:
     save_state(state, provider_key)
 
 
-def run_loop(provider_key: str) -> None:
-    """Continuously poll the given provider at CHECK_INTERVAL seconds."""
+def run_loop(provider_key: str, interval_secs: int) -> None:
+    """Continuously poll the given provider at interval_secs seconds."""
     provider = _get_provider(provider_key)
     logger.info("Scraper Agent started (provider=%s, interval=%ds, recipient=%s)",
-                provider.name, CHECK_INTERVAL, EMAIL_TO)
+                provider.name, interval_secs, EMAIL_TO)
     while True:
         try:
             check_once(provider_key)
@@ -405,7 +405,7 @@ def run_loop(provider_key: str) -> None:
         except Exception as exc:
             logger.error("[%s] Unexpected error: %s", provider.name, exc)
         now = time.time()
-        sleep_secs = CHECK_INTERVAL - (now % CHECK_INTERVAL)
+        sleep_secs = interval_secs - (now % interval_secs)
         logger.debug("Sleeping %.0fs until next check boundary", sleep_secs)
         time.sleep(sleep_secs)
 
@@ -504,7 +504,9 @@ if __name__ == "__main__":
         if addr.strip()
     ]
 
+    interval_secs = int(_getenv_provider_scoped("CHECK_INTERVAL", provider_key) or str(CHECK_INTERVAL))
+
     if mode == "once":
         check_once(provider_key)
     else:
-        run_loop(provider_key)
+        run_loop(provider_key, interval_secs=interval_secs)
