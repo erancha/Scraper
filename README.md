@@ -1,13 +1,18 @@
 # NBA Scoreboard Scraper Agent
 
-A Python agent that continuously scrapes the ESPN NBA scoreboard, detects newly completed games, and emails a summary table.
+A Python agent that continuously scrapes data from multiple pluggable providers, detects new/completed items, and emails a summary table.
 
 ## Features
 
-- Fetches live NBA scoreboard data from ESPN's public API
+- Supports multiple providers via `providers/*` (e.g. `espn_nba`, `ynet_news`, `ynet_sport`)
+- Fetches data from provider sources (API JSON / HTML)
 - Displays scores, odds, venue, broadcast info, and player leaders in the console
 - Tracks completed games between checks using a local `state.<provider-key>.json` file
-- Sends an HTML email with a formatted results table when new games finish
+- Sends an HTML email with a formatted summary table when new items are detected
+
+## Architecture
+
+![Scraper architecture diagram](docs/architecture.svg)
 
 ## Quick Start (WSL)
 
@@ -45,6 +50,9 @@ The agent uses SMTP to send emails. For **Gmail**, create an [App Password](http
 | File                        | Purpose                            |
 | --------------------------- | ---------------------------------- |
 | `scraper.py`                | Main agent (scrape, detect, email) |
+| `providers/espn_nba.py`     | ESPN NBA provider                  |
+| `providers/ynet_news.py`    | Ynet news provider                 |
+| `providers/ynet_sport.py`   | Ynet sport provider                |
 | `setup.sh`                  | One-time environment setup         |
 | `run.sh`                    | Launch the agent                   |
 | `.env.example`              | Template for environment variables |
