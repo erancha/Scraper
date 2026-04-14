@@ -47,13 +47,44 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+
+def _getenv_int(name: str, default: int) -> int:
+    """Parse an integer environment variable, tolerating inline `#` comments.
+
+    Returns `default` if the variable is unset/empty or cannot be parsed.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    cleaned = str(raw).split("#", 1)[0].strip()
+    if not cleaned:
+        return default
+    try:
+        return int(cleaned)
+    except ValueError:
+        return default
+
+
+def _getenv_provider_scoped_int(name: str, provider_key: str, default: int) -> int:
+    """Parse a provider-scoped integer env var, tolerating inline `#` comments."""
+    raw = _getenv_provider_scoped(name, provider_key)
+    cleaned = str(raw).split("#", 1)[0].strip()
+    if not cleaned:
+        return default
+    try:
+        return int(cleaned)
+    except ValueError:
+        return default
+
+
 STATE_FILE = Path(os.getenv("STATE_FILE") or "state.json")
 EMAIL_TO: list[str] = []
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_PORT = _getenv_int("SMTP_PORT", 587)
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # seconds between checks
+CHECK_INTERVAL = _getenv_int("CHECK_INTERVAL", 300)  # seconds between checks
 DRY_RUN = False  # Set via --dry-run CLI flag; skips actual email sending
 
 
@@ -504,7 +535,7 @@ if __name__ == "__main__":
         if addr.strip()
     ]
 
-    interval_secs = int(_getenv_provider_scoped("CHECK_INTERVAL", provider_key) or str(CHECK_INTERVAL))
+    interval_secs = _getenv_provider_scoped_int("CHECK_INTERVAL", provider_key, CHECK_INTERVAL)
 
     if mode == "once":
         check_once(provider_key)
