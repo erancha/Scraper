@@ -68,7 +68,7 @@ class EmailUrlSummary(Provider):
             logger.warning("[%s] IMAP not configured (IMAP_HOST/IMAP_USER/IMAP_PASS) - skipping fetch.", self.name)
             return {"messages": [], "fetched_at": datetime.now(timezone.utc).isoformat()}
 
-        from_filter = (os.getenv("EMAIL_POLL_FROM") or "").strip()
+        from_filter = (os.getenv("EMAIL_POLL_FROM") or "").split("#", 1)[0].strip()
         mark_seen_raw = (os.getenv("EMAIL_POLL_MARK_SEEN") or "true").strip().lower()
         mark_seen = mark_seen_raw not in {"0", "false", "no"}
         max_emails = int((os.getenv("EMAIL_POLL_MAX_EMAILS") or "10").strip() or 10)
