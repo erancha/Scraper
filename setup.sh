@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# setup.sh – Set up the NBA Scraper Agent environment (run in WSL)
+# setup.sh – Set up the Scraper Agent environment (run in WSL)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "=== NBA Scraper Agent – Setup ==="
+echo "=== Scraper Agent – Setup ==="
 
 # Check Python version (require 3.8+)
 PYTHON_VERSION=$(python3 -c 'import sys; print(sys.version_info[:2] >= (3, 8))' 2>/dev/null || echo "False")
